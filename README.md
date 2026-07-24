@@ -171,5 +171,3 @@ The **.env** file is ready for environment variables — extend it for YouTube A
 ---
 
 *Reverie is an open‑source project. Contributions, forks, and late‑night feature experiments are welcome.*
-#   r e v e r i e  
- 
