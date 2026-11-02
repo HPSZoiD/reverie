@@ -11,6 +11,20 @@ build/
 node_modules/
 dist/
 
+# Logs
+*.log
+
+# Local data
+database/*.db
+database/*.db-journal
+
+# Build info
+*.tsbuildinfo
+
+# Test media
+test_audio.m4a
+test_ytdlp.m4a
+
 # OS
 .DS_Store
 Thumbs.db

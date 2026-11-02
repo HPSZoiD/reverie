@@ -21,9 +21,34 @@ function Start-Backend {
   $job = Start-Job -Name "Backend" -ScriptBlock {
     param($dir)
     Set-Location $dir
-    .\venv\Scripts\python -m uvicorn server:app --reload --port 8000 --log-level info 2>&1
+    .\venv\Scripts\python -m uvicorn server:app --host 0.0.0.0 --reload --port 8000 --log-level info 2>&1
   } -ArgumentList $ScriptPath
   return $job
+}
+
+# ─── LAN Exposure Helpers ────────────────────────────────────────
+
+function Get-LanIp {
+  return @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254*' } |
+    Select-Object -ExpandProperty IPAddress)
+}
+
+function Add-ExposeFirewallRules {
+  foreach ($port in 5173, 8000) {
+    $ruleName = "Reverie-Expose-TCP-$port"
+    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if ($existing) {
+      Write-Host "  Firewall rule $ruleName already exists" -ForegroundColor DarkGray
+      continue
+    }
+    try {
+      New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+      Write-Host "  Firewall: allowed TCP $port (all network profiles)" -ForegroundColor Green
+    } catch {
+      Write-Host "  Firewall: could not add rule for TCP $port (run as admin if needed)" -ForegroundColor Yellow
+    }
+  }
 }
 
 function Wait-ForPort($port, $label, $timeout = 15) {
@@ -57,6 +82,19 @@ $logFile = Join-Path $ScriptPath "server.log"
 Write-Host "╔══════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "║         Reverie Engine               ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════╝" -ForegroundColor Cyan
+""
+
+# ─── LAN Exposure ────────────────────────────────────────────────
+$lanIps = @(Get-LanIp)
+if ($lanIps.Count -gt 0) {
+  Write-Host "→ Exposing to LAN..." -ForegroundColor Cyan
+  Add-ExposeFirewallRules
+  foreach ($ip in $lanIps) {
+    Write-Host "  Detected LAN IP: $ip" -ForegroundColor DarkGray
+  }
+} else {
+  Write-Host "→ Could not detect a LAN IP; running on localhost only" -ForegroundColor Yellow
+}
 ""
 
 # ─── Start Processes ────────────────────────────────────────────
@@ -101,8 +139,16 @@ while ((-not $backendReady -or -not $frontendReady) -and ((Get-Date) - $startTim
 }
 
 ""; Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
-if (-not $NoFrontend) { Write-Host " Frontend : http://localhost:5173" -ForegroundColor White }
-if (-not $NoBackend)  { Write-Host " Backend  : http://127.0.0.1:8000"  -ForegroundColor White }
+if (-not $NoFrontend) { Write-Host " Frontend (local) : http://localhost:5173" -ForegroundColor White }
+if (-not $NoBackend)  { Write-Host " Backend  (local) : http://127.0.0.1:8000"  -ForegroundColor White }
+if ($lanIps.Count -gt 0) {
+  Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
+  Write-Host " LAN Access (use from other devices):" -ForegroundColor Green
+  foreach ($ip in $lanIps) {
+    if (-not $NoFrontend) { Write-Host "   http://$ip`:5173" -ForegroundColor Green }
+    if (-not $NoBackend)  { Write-Host "   http://$ip`:8000  (API)" -ForegroundColor Green }
+  }
+}
 Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
 ""; Write-Host "Live output (Ctrl+C to stop all):" -ForegroundColor Cyan
 

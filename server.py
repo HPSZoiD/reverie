@@ -20,7 +20,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from backend.database import DatabaseManager
 from backend.discovery import DiscoveryEngine
 from backend.analysis import AudioAnalyzer
-from backend.streamflow_queue import router as streamflow_router
+from backend.streamflow_queue import router as streamflow_router, extract_youtube_url
 from backend.download_manager import download_video, download_locks, locks_mutex, AUDIO_TEMP_DIR
 
 app = FastAPI(title="Reverie Music Player")
@@ -52,7 +52,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 # Setup Paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 WEB_DIR = os.path.join(BASE_DIR, "web")
 STATIC_DIR = os.path.join(WEB_DIR, "static")
 TEMPLATES_DIR = os.path.join(WEB_DIR, "templates")
@@ -87,10 +91,12 @@ analyze_status = {"running": False, "progress": 0, "total": 0}
 
 def get_current_user(request: Request):
     auth = request.headers.get('Authorization', '')
-    if not auth.startswith('Bearer '):
-        return None
-    token = auth[7:]
-    return db.get_session(token)
+    if auth.startswith('Bearer '):
+        token = auth[7:]
+        user = db.get_session(token)
+        if user:
+            return user
+    return db.get_or_create_guest_user()
 
 def require_user(request: Request):
     user = get_current_user(request)
@@ -114,7 +120,7 @@ class DownloadRequest(BaseModel):
     video_id: str
 
 @app.post("/api/download")
-async def download_audio(data: DownloadRequest):
+async def download_audio(data: DownloadRequest, request: Request):
     """Downloads YouTube audio via yt-dlp and returns a serving URL."""
     video_id = data.video_id
 
@@ -122,7 +128,7 @@ async def download_audio(data: DownloadRequest):
         output_path = await download_video(video_id)
         return {
             "success": True,
-            "audio_url": f"http://localhost:8000/audio/{video_id}.m4a",
+            "audio_url": f"{request.base_url}audio/{video_id}.m4a",
             "filename": f"{video_id}.m4a"
         }
     except RuntimeError as e:
@@ -138,6 +144,36 @@ async def download_audio(data: DownloadRequest):
             "success": False,
             "error": str(e)
         })
+
+# ─── YouTube URL / Playlist Endpoints ─────────────────────────
+
+class YouTubeExtractRequest(BaseModel):
+    url: str
+
+@app.post("/api/youtube/extract")
+async def extract_yt(data: YouTubeExtractRequest):
+    """Extracts tracks / playlist info from any YouTube or YouTube Music URL via yt-dlp."""
+    try:
+        res = await extract_youtube_url(data.url)
+        return res
+    except Exception as e:
+        print(f"[YouTube Extract Error] {e}")
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+class YouTubePlaylistImportRequest(BaseModel):
+    name: str
+    tracks: list[dict]
+
+@app.post("/api/youtube/playlist/import")
+async def import_yt_playlist(data: YouTubePlaylistImportRequest, request: Request):
+    """Creates a new playlist and saves all extracted YouTube tracks in one atomic database operation."""
+    user = require_user(request)
+    if not data.tracks:
+        return JSONResponse(status_code=400, content={"error": "No tracks provided"})
+    pl = db.create_playlist_with_tracks(user["id"], data.name, data.tracks)
+    if not pl:
+        return JSONResponse(status_code=500, content={"error": "Failed to create playlist"})
+    return pl
 
 
 # ─── Auth Endpoints ─────────────────────────────────────────────
@@ -270,7 +306,7 @@ class HistoryEntry(BaseModel):
 @app.get("/api/history")
 async def get_history(request: Request):
     user = require_user(request)
-    return db.get_listening_history(user["id"], limit=50)
+    return db.get_listening_history(user["id"], limit=30)
 
 @app.post("/api/history")
 async def add_history(data: HistoryEntry, request: Request):

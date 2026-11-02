@@ -5,7 +5,6 @@ import App from './App';
 import { AudioProvider } from './contexts/AudioContext';
 import { SettingsProvider } from './contexts/SettingsContext';
 import { AuthProvider } from './contexts/AuthContext';
-import { AuthModal } from './components/AuthModal';
 import './index.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
@@ -15,7 +14,6 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
         <SettingsProvider>
           <AudioProvider>
             <App />
-            <AuthModal />
           </AudioProvider>
         </SettingsProvider>
       </AuthProvider>

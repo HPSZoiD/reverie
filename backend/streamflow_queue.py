@@ -381,3 +381,114 @@ async def search(q: str, limit: int = 20):
     except Exception as e:
         print(f"Error searching YouTube for '{q}': {e}")
         return []
+
+
+# ─── EXTRACT PLAYLIST / LINK ────────────────────────────────
+
+from urllib.parse import urlparse, parse_qs
+
+async def extract_youtube_url(url: str) -> dict:
+    """Extract playlist or video information from a YouTube or YouTube Music URL using yt-dlp."""
+    url = url.strip()
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    selected_id = qs.get("v", [None])[0]
+
+    command = [
+        YTDLP_PATH,
+        url,
+        "--flat-playlist",
+        "-J",
+        "--no-download",
+        "--js-runtimes", "node:C:\\Program Files\\nodejs\\node.exe",
+        "--remote-components", "ejs:github",
+        "--no-cache-dir",
+    ]
+
+    try:
+        output = await run_command(command)
+        data = json.loads(output)
+    except Exception as e:
+        print(f"[Extract Error] Failed to extract YouTube URL {url}: {e}")
+        raise RuntimeError(f"Could not load YouTube link: {str(e)}")
+
+    entries = data.get("entries")
+    if entries is not None:
+        title = data.get("title") or "YouTube Playlist"
+        author = data.get("channel") or data.get("uploader") or ""
+        author = author.replace("- Topic", "").strip() if author else "YouTube"
+
+        tracks = []
+        for e in entries:
+            if not e or not e.get("id"):
+                continue
+            vid = e.get("id")
+            t_title = e.get("title") or "Unknown Title"
+            t_artist = e.get("channel") or e.get("uploader") or author or "YouTube"
+            t_artist = t_artist.replace("- Topic", "").strip()
+
+            thumb = ""
+            thumbs = e.get("thumbnails")
+            if thumbs and isinstance(thumbs, list) and len(thumbs) > 0:
+                thumb = thumbs[-1].get("url", "") if isinstance(thumbs[-1], dict) else ""
+            elif isinstance(thumbs, dict):
+                thumb = thumbs.get("url", "")
+            if not thumb:
+                thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+            tracks.append({
+                "id": vid,
+                "title": t_title,
+                "artist": t_artist,
+                "thumbnail": thumb,
+                "duration": e.get("duration") or 0,
+                "bpm": None,
+                "source": "youtube"
+            })
+
+        playlist_thumb = tracks[0]["thumbnail"] if tracks else None
+
+        return {
+            "type": "playlist",
+            "title": title,
+            "author": author,
+            "thumbnail": playlist_thumb,
+            "tracks": tracks,
+            "count": len(tracks),
+            "selected_id": selected_id
+        }
+    else:
+        vid = data.get("id")
+        t_title = data.get("title") or "Unknown Title"
+        t_artist = data.get("channel") or data.get("uploader") or "YouTube"
+        t_artist = t_artist.replace("- Topic", "").strip()
+
+        thumb = ""
+        thumbs = data.get("thumbnails")
+        if thumbs and isinstance(thumbs, list) and len(thumbs) > 0:
+            thumb = thumbs[-1].get("url", "") if isinstance(thumbs[-1], dict) else ""
+        elif isinstance(thumbs, dict):
+            thumb = thumbs.get("url", "")
+        if not thumb and vid:
+            thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+        single_track = {
+            "id": vid,
+            "title": t_title,
+            "artist": t_artist,
+            "thumbnail": thumb,
+            "duration": data.get("duration") or 0,
+            "bpm": None,
+            "source": "youtube"
+        }
+
+        return {
+            "type": "video",
+            "title": t_title,
+            "author": t_artist,
+            "thumbnail": thumb,
+            "tracks": [single_track],
+            "count": 1,
+            "selected_id": vid
+        }
+

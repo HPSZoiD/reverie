@@ -102,6 +102,9 @@ class AutoMixEngine {
         let energy = 0;
         let beatOffset = 0;
         let overlapBars = 8;
+        let bpmRange = 0;
+        let analysisOk = false;
+        let analysisFallback = false;
         
         console.log(`[AutoMix] High-precision analysis for "${trackData.title}" (4-window BPM + Energy Drop)...`);
         
@@ -148,10 +151,14 @@ class AutoMixEngine {
                 confidence = filteredConfs.reduce((a, b) => a + b, 0) / filteredConfs.length;
 
                 const range = Math.max(...filteredSorted) - Math.min(...filteredSorted);
-                if (range > 15) {
+                bpmRange = range;
+                const referenceBpm = bpm || trackData?.tempo || 120;
+                const variableThreshold = Math.max(14, referenceBpm * 0.12);
+                if (range > variableThreshold) {
                     tempoVariable = true;
-                    console.warn(`[AutoMix] Tempo Variable! Range: ${range.toFixed(1)} BPM.`);
+                    console.warn(`[AutoMix] Tempo Variable! Range: ${range.toFixed(1)} BPM (threshold ${variableThreshold.toFixed(1)}).`);
                 }
+                analysisOk = true;
                 
                 console.log(`[AutoMix] Consensus: BPM=${bpm.toFixed(2)} | Conf=${confidence.toFixed(2)} | Energy=${energy.toFixed(3)}`);
 
@@ -165,11 +172,23 @@ class AutoMixEngine {
             }
         } catch (e) {
             console.error('[AutoMix] Analysis failed:', e);
-            bpm = trackData.tempo || 120;
-            confidence = 0.5;
+            analysisOk = false;
         }
 
-        bpm = this.normalizeBPM(bpm);
+        if (!analysisOk || !bpm) {
+            analysisFallback = true;
+            if (trackData?.tempo) {
+                bpm = trackData.tempo || 120;
+                confidence = 0.65;
+                console.log(`[AutoMix] Using stored tempo fallback: ${bpm} BPM (conf 0.65).`);
+            } else {
+                bpm = 0;
+                confidence = 0.15;
+                console.warn(`[AutoMix] No metadata tempo available; treating analysis as low-confidence (${confidence}).`);
+            }
+        }
+
+        if (bpm > 0) bpm = this.normalizeBPM(bpm);
         if (audioBuffer) {
             beatOffset = this.detectBeatOffset(audioBuffer);
         }
@@ -192,7 +211,7 @@ class AutoMixEngine {
         const rmsAtMixPoint = this._tempRms || 0;
         const avgRMS = this._tempAvg || 0;
         
-        return { bpm, beats, tempoVariable, mixPointAt, overlapBars, beatOffset, energy, confidence, rmsAtMixPoint, avgRMS };
+        return { bpm, beats, tempoVariable, mixPointAt, overlapBars, beatOffset, energy, confidence, rmsAtMixPoint, avgRMS, bpmRange, analysisFallback };
     }
 
     detectMixPoint(audioBuffer, bpm) {
@@ -406,11 +425,13 @@ class AutoMixEngine {
     }
 
     planTransition(analysisA, analysisB, durationA) {
-        const bpmA = analysisA.bpm || 120;
-        const bpmB = analysisB.bpm || 120;
+        const bpmA = analysisA.bpm || 0;
+        const bpmB = analysisB.bpm || 0;
 
-        let effectiveBpmA = bpmA;
-        let effectiveBpmB = bpmB;
+        const missingBpm = !bpmA || !bpmB;
+
+        let effectiveBpmA = bpmA || 120;
+        let effectiveBpmB = bpmB || 120;
 
         if (effectiveBpmA > 130 && Math.abs(effectiveBpmA / 2 - effectiveBpmB) <= 20) {
             effectiveBpmA = effectiveBpmA / 2;
@@ -429,17 +450,64 @@ class AutoMixEngine {
         const energyDiff = Math.abs(energyA - energyB) / Math.max(0.001, energyA, energyB);
         const bothVariable = analysisA.tempoVariable && analysisB.tempoVariable;
 
+        const reasons = [];
+
+        const veryLowConfidence = avgConf < 0.20;
+        const veryLargeDelta = delta > 20;
+        const veryLargeEnergyDiff = energyDiff > 0.85;
+
+        const bpmSpreadA = analysisA.bpmRange ?? 0;
+        const bpmSpreadB = analysisB.bpmRange ?? 0;
+        const maxBpmSpread = Math.max(bpmSpreadA, bpmSpreadB);
+
+        const severelyUnstable =
+            bothVariable &&
+            (maxBpmSpread > 25 || avgConf < 0.45 || delta > 8);
+
+        const TIER_RANK = { XFADE_SHORT: 0, HARD: 1, MODERATE: 2, CLEAN: 3, PERFECT: 4 };
+        const RANK_TIER = ['XFADE_SHORT', 'HARD', 'MODERATE', 'CLEAN', 'PERFECT'];
+
         let tier;
-        if (delta > 20 || avgConf < 0.35 || energyDiff > 0.7 || bothVariable) {
+        if (missingBpm) {
+            reasons.push('missing-bpm');
             tier = 'XFADE_SHORT';
-        } else if (delta <= 2 && avgConf > 0.85 && energyDiff < 0.2 && !analysisA.tempoVariable && !analysisB.tempoVariable) {
-            tier = 'PERFECT';
-        } else if (delta <= 5 && avgConf > 0.65 && energyDiff < 0.35) {
-            tier = 'CLEAN';
-        } else if (delta <= 10 && avgConf > 0.5) {
-            tier = 'MODERATE';
+        } else if (veryLargeDelta || veryLowConfidence || veryLargeEnergyDiff || severelyUnstable) {
+            if (veryLargeDelta) reasons.push('delta>20');
+            if (veryLowConfidence) reasons.push('avgConf<0.20');
+            if (veryLargeEnergyDiff) reasons.push('energyDiff>0.85');
+            if (severelyUnstable) reasons.push('severelyUnstable');
+            tier = 'XFADE_SHORT';
         } else {
-            tier = 'HARD';
+            if (delta <= 2 && avgConf > 0.85 && energyDiff < 0.2 && !analysisA.tempoVariable && !analysisB.tempoVariable) {
+                tier = 'PERFECT';
+            } else if (delta <= 5 && avgConf > 0.65 && energyDiff < 0.35) {
+                tier = 'CLEAN';
+            } else if (delta <= 10 && avgConf > 0.5) {
+                tier = 'MODERATE';
+            } else {
+                tier = 'HARD';
+            }
+
+            let maxAllowedRank = TIER_RANK.PERFECT;
+            if (bothVariable) {
+                maxAllowedRank = Math.min(maxAllowedRank, TIER_RANK.MODERATE);
+                reasons.push('bothVariable-cap-MODERATE');
+            }
+            if (avgConf < 0.5) {
+                maxAllowedRank = Math.min(maxAllowedRank, TIER_RANK.MODERATE);
+                reasons.push('avgConf<0.5-cap-MODERATE');
+            }
+            if (energyDiff > 0.5) {
+                maxAllowedRank = Math.min(maxAllowedRank, TIER_RANK.MODERATE);
+                reasons.push('energyDiff>0.5-cap-MODERATE');
+            }
+            if (TIER_RANK[tier] > maxAllowedRank) {
+                const capped = RANK_TIER[maxAllowedRank];
+                reasons.push(`capped-${tier}->${capped}`);
+                tier = capped;
+            } else {
+                reasons.push('none');
+            }
         }
 
         console.log('[AutoMix][Transition] BPM:', {
@@ -450,6 +518,25 @@ class AutoMixEngine {
             delta
         });
         console.log('[AutoMix][Transition] Tier:', tier);
+
+        console.debug('[automix] transition decision', {
+            bpmA,
+            bpmB,
+            delta,
+            confA,
+            confB,
+            avgConf,
+            energyA,
+            energyB,
+            energyDiff,
+            bpmRangeA: bpmSpreadA,
+            bpmRangeB: bpmSpreadB,
+            tempoVariableA: analysisA.tempoVariable,
+            tempoVariableB: analysisB.tempoVariable,
+            bothVariable,
+            chosenTier: tier,
+            reasons
+        });
 
         const beatDuration = 60 / effectiveBpmA;
         const barDuration = 4 * beatDuration;
@@ -503,6 +590,16 @@ class AutoMixEngine {
         }
 
         console.log(`[AutoMix] Decision: ${tier} | Delta=${delta.toFixed(1)} | EnergyDiff=${(energyDiff * 100).toFixed(0)}%`);
+
+        window.__automixStats = window.__automixStats || {
+            PERFECT: 0,
+            CLEAN: 0,
+            MODERATE: 0,
+            HARD: 0,
+            XFADE_SHORT: 0
+        };
+        window.__automixStats[tier] = (window.__automixStats[tier] || 0) + 1;
+        console.table(window.__automixStats);
 
         return {
             fadeOutAt,

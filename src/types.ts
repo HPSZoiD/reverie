@@ -35,6 +35,15 @@ export interface AnalysisResult {
   key: string;              // Camelot code, e.g., "8B"
   rmsAtMixPoint?: number;
   avgRMS?: number;
+  bpmReliable: boolean;
+  bpmRange: number;
+  analysisFallback?: boolean;
+
+  safeStartOffset?: number;
+  introSilenceSecs?: number;
+  introEnergy?: number;
+  audibleEndAt?: number;
+  outroSilenceSecs?: number;
 }
 
 export interface TransitionPlan {
@@ -48,6 +57,7 @@ export interface TransitionPlan {
   beatOffsetA: number;
   keyA?: string;
   keyB?: string;
+  incomingOffset?: number;
 }
 
 export interface DeckState {

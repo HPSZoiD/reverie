@@ -1,173 +1,282 @@
+# Reverie — HPS Labs
 
-# 𝐑𝐄𝐕𝐄𝐑𝐈𝐄
+**Reverie is a self-hosted music player with DJ-style auto-mix transitions and YouTube streaming capabilities.**
 
-> *A next‑generation music intelligence platform — blending local audio libraries, YouTube streaming, and AI‑driven seamless transitions into one dark, minimal experience.*
+## 🎵 Overview
 
-**Reverie** is a full‑stack music player built with **FastAPI** (Python) on the backend and **React + Vite + Tailwind CSS** on the frontend (with a secondary static‑HTML interface). It scans your local music folders, analyzes track audio features using librosa, streams audio directly from your filesystem and YouTube, and — most importantly — uses a sophisticated **AutoMix engine** to beat‑match and crossfade between tracks like a professional DJ.
+Reverie is a full-featured audio application that combines local music library management with intelligent beat-matched transitions and YouTube integration. It's designed to provide an immersive listening experience by intelligently mixing tracks together using advanced audio analysis and DJ-style transitions.
 
----
+Key features include:
+- Local music library scanning and management
+- Advanced audio analysis for tempo, energy, and harmonic compatibility
+- Intelligent auto-mix transitions with 3-band dynamic EQ wiping
+- YouTube Music integration with real-time radio queue generation
+- Harmonic mixing using Camelot Wheel key detection
+- Sample-accurate beat synchronization
+- Web-based interface with modern UI/UX
 
-## ✦ Core Features
+## 🏗️ Architecture
 
-| Feature | Description |
-|---|---|
-| **Local Library Scanner** | Recursively scan folders for MP3, FLAC, M4A, OGG, WAV files. Extracts metadata via mutagen. |
-| **Audio Analysis Pipeline** | Python‑side analysis (librosa) extracts BPM, energy, chroma features, spectral centroid. Stored per‑track for similarity search. |
-| **Smart Discovery Engine** | Cosine‑similarity + BPM tier ranking to recommend musically compatible tracks. Epsilon‑greedy exploration/exploitation balance. |
-| **AutoMix Engine** | Real‑time client‑side beat‑matched transitions with phrase snapping, adaptive EQ wiping, tempo ramping, and reverb. **The crown jewel.** |
-| **YouTube Integration** | Search YouTube, download audio via yt‑dlp, fetch real YouTube Music radio queues. |
-| **StreamFlow Queue** | Analysis‑aware queue ranking — prefetches & caches audio analysis to score upcoming tracks by BPM/energy compatibility. |
-| **User System** | Auth (signup/login), liked songs, listening history, playlists, language preferences. |
-| **Two Frontends** | Modern React SPA (src/) with framer‑motion animations + grainy textures + dark theme. Legacy static HTML/JS interface (web/). |
-| **Audio Visualizer** | Circular radial bar frequency visualizer synced to the active deck's AnalyserNode. |
+### Backend (Python/Server-side)
+- **Framework**: FastAPI with Uvicorn
+- **Database**: SQLite (via sqlite3)
+- **Audio Analysis**: librosa, scikit-learn, numpy, scipy, Pillow
+- **Audio Processing**: PySide6, mutagen
+- **Web Tools**: Jinja2 templates, python-multipart
+- **YouTube Integration**: yt-dlp with Node.js runtime support
 
----
+### Frontend (React/Client-side)
+- **Framework**: React 18 with TypeScript 5.6 and Vite 5.4
+- **Styling**: Tailwind CSS 3.4 with custom dark theme
+- **UI Components**: lucide-react icons, @dnd-kit for drag-and-drop, Framer Motion for animations
+- **Routing**: react-router-dom 6
+- **Audio Engine**: Web Audio API for auto-mix transitions
 
-## ✦ Project Structure
+## 🔧 Key Technical Features
+
+### Audio Analysis Engine
+- **Beat Detection**: Multi-window BPM detection with consensus algorithm
+- **Key Detection**: Camelot Wheel mapping using Goertzel-based chroma analysis
+- **Energy Analysis**: RMS-based energy calculation for dynamic EQ
+- **Mix Point Detection**: Energy drop detection for optimal transition points
+- **Tempo Normalization**: Standardized 70-140 BPM range matching AutoMix frontend
+
+### Auto-Mix Engine (Web Audio API)
+- **Sample-Accurate Transitions**: Uses AudioBufferSourceNode architecture for precise timing
+- **3-Band Dynamic EQ Wiping**: Low/Mid/High frequency bands processed independently during transitions
+- **Playback Rate Automation**: Native Web Audio API automation instead of requestAnimationFrame hacks
+- **Harmonic Mixing**: Camelot Wheel key compatibility detection
+- **Beat-Synced Transitions**: Synchronized with musical beats for seamless mixing
+
+### YouTube Integration
+- **Real Radio Queues**: Uses yt-dlp to fetch actual YouTube Music radio queues (RDAMVM playlist)
+- **Fallback API**: Manual YTM API as backup when yt-dlp fails
+- **Analysis-Aware Ranking**: Scores tracks by BPM/energy compatibility when cached analysis is available
+- **Background Prefetching**: Downloads and analyzes upcoming tracks in background
+
+## 📁 Project Structure
 
 ```
-reverie_reboot/
+reverie/
 ├── backend/
-│   ├── __init__.py
-│   ├── database.py          # SQLite DB manager — users, tracks, playlists, history, settings
-│   ├── analysis.py          # librosa-based BPM, energy, chroma feature extraction
-│   ├── discovery.py         # Cosine-similarity + BPM-tier recommendation engine
-│   ├── streamflow_queue.py  # YouTube radio fetching, scoring, prefetch, search
-│   └── download_manager.py  # yt-dlp audio download with per-video async locks
-│
-├── frontend/
-│   ├── types.ts             # Shared TS interfaces (Track, AnalysisResult, DeckState, etc.)
-│   ├── automix-engine.ts    # AutoMix Engine v2.0 — AudioBufferSourceNode architecture
-│   └── AutoMixEngine2.ts    # AutoMix Engine v2 — MediaElementAudioSourceNode based (dual-deck)
-│
-├── src/                     # [React + Vite] Modern frontend
-│   ├── main.tsx             # Entry — BrowserRouter, AuthProvider, AudioProvider
-│   ├── App.tsx              # Route definitions with animated page transitions
-│   ├── screens/             # HomeScreen, SearchScreen, LibraryScreen, SettingsScreen, NowPlayingScreen
-│   ├── components/          # AppShell, AuthModal, PlayerBar, and more
-│   ├── contexts/            # AudioContext, AuthContext, SettingsContext
-│   ├── lib/                 # Utilities, animations
-│   └── services/            # API service layer
-│
-├── web/                     # [Static HTML/JS] Legacy frontend
-│   ├── templates/index.html # 754-line single-page app with Tailwind CDN
-│   └── static/js/
-│       ├── automix.js       # AutoMix Engine (JS port, dual-deck HTMLMediaElement based)
-│       ├── player.js        # Dual-deck audio player with crossfade orchestration
-│       ├── app.js           # Main app logic — library, playlists, recommendations, settings
-│       └── visualizer.js    # Circular radial frequency visualizer
-│
-├── server.py                # FastAPI app — all API routes, CORS, auth, scan, analyze
-├── package.json             # Vite + React + Tailwind + framer-motion deps
-├── requirements.txt         # Python deps: FastAPI, uvicorn, librosa, numpy, mutagen, scikit-learn
-├── tailwind.config.js       # Custom dark theme — Syne/Figtree/JetBrains Mono, neon-accent palette
-├── vite.config.ts           # Vite config with @/ alias, port 5173
-├── tsconfig.json            # TypeScript strict config
-├── start.ps1                # PowerShell launcher — starts both backend & frontend in background jobs
-└── .env                     # Environment variables (empty, ready for secrets)
+│   ├── database.py          # SQLite database management with user, playlist, history tables
+│   ├── discovery.py         # Recommendation engine based on audio similarity and BPM compatibility
+│   ├── analysis.py          # Audio feature extraction using librosa
+│   ├── streamflow_queue.py  # YouTube queue generation with analysis-aware ranking
+│   └── download_manager.py  # YouTube download manager with locking for concurrency
+├── src/
+│   ├── components/          # React UI components
+│   ├── contexts/            # React context providers (user, theme, etc.)
+│   ├── lib/                 # Audio processing libraries (AutoMixEngine, AudioPlayer)
+│   ├── screens/             # Main application screens
+│   ├── services/            # API service layer
+│   └── utils/               # Utility functions
+├── server.py                # FastAPI server with all endpoints
+└── package.json             # Frontend dependencies and scripts
 ```
 
----
+## 🚀 Features
 
-## ✦ Tech Stack
+### Local Music Library Management
+- Folder scanning with metadata extraction (MP3, FLAC, M4A, OGG, WAV)
+- Track analysis for tempo, energy, and chroma features
+- Play counting and skip tracking
+- Local music library organization
 
-| Layer | Technology |
-|---|---|
-| **Backend** | Python 3.13, FastAPI, Uvicorn, SQLite |
-| **Audio Analysis** | librosa, numpy, scipy, scikit‑learn, mutagen |
-| **YouTube** | yt‑dlp (via venv), httpx (fallback API) |
-| **Frontend (React)** | React 18, TypeScript 5.6, Vite 5, Tailwind CSS 3.4, framer‑motion, lucide‑react, @dnd‑kit |
-| **Frontend (Static)** | Vanilla JS (ES6 class syntax), Tailwind CDN, Web Audio API |
-| **Fonts** | Syne (headlines), Figtree (body), JetBrains Mono (code/mono), Material Symbols (icons) |
-| **Auth** | SHA‑256 password hashing, UUID session tokens |
+### AutoMix Transitions
+- Beat-synced crossfades with 3-band dynamic EQ wiping via Web Audio API
+- Sample-accurate timing using AudioBufferSourceNode architecture
+- Harmonic mixing using Camelot Wheel key detection
+- Tempo normalization to 70-140 BPM range
+- Intelligent transition planning based on audio analysis
 
----
+### YouTube Integration
+- YouTube Music radio queue generation via yt-dlp
+- Playlist and video extraction with thumbnail support
+- Background prefetching of audio for analysis
+- Real-time queue ranking by compatibility scores
 
-## ✦ Quick Start
+### User System
+- Authentication (email/password)
+- Playlists and liked songs management
+- Listening history tracking
+- User settings with language preferences
 
-```powershell
-# 1. Clone and enter directory
-cd reverie_reboot
+### Recommendations
+- Content-based filtering using audio features
+- Exploration/exploitation balance with epsilon-greedy algorithm
+- Similarity-based track recommendations
+- History-aware suggestion generation
 
-# 2. Create & activate Python virtual environment
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+## 🛠️ Development Setup
 
-# 3. Install dependencies
+1. Install Python dependencies:
+```bash
 pip install -r requirements.txt
+```
+
+2. Install Node.js dependencies:
+```bash
 npm install
-
-# 4. Run the launcher
-.\start.ps1
 ```
 
-The launcher starts both:
-- **Backend** → `http://127.0.0.1:8000` (FastAPI + Uvicorn)
-- **Frontend** → `http://localhost:5173` (Vite dev server)
-
----
-
-## ✦ API Endpoints (FastAPI)
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/tracks` | List all scanned tracks |
-| `GET` | `/api/search?q=&source=local\|youtube` | Search local library or YouTube |
-| `GET` | `/api/stream/{track_id}` | Stream audio file (supports range requests) |
-| `POST` | `/api/download` | Download YouTube audio via yt‑dlp |
-| `DELETE` | `/api/audio/{video_id}` | Delete cached audio file |
-| `GET` | `/api/recommendations` | Get AI music recommendations |
-| `POST` | `/api/scan` | Start folder scan (background thread) |
-| `GET` | `/api/scan/status` | Scan progress |
-| `POST` | `/api/analyze` | Start audio feature analysis (background thread) |
-| `GET` | `/api/analyze/status` | Analysis progress |
-| `GET` | `/api/queue/next?video_id=` | Get scored YouTube radio queue (StreamFlow) |
-| `POST` | `/api/auth/signup` | Create account |
-| `POST` | `/api/auth/login` | Log in |
-| `GET` | `/api/auth/me` | Current user session |
-| `GET/POST` | `/api/liked-songs` | Like/unlike tracks |
-| `GET/POST` | `/api/history` | Listening history |
-| `GET/POST` | `/api/playlists` | User playlist CRUD |
-| `GET/PUT` | `/api/user/settings` | Language preferences |
-
----
-
-## ✦ Configuration
-
-The **tailwind.config.js** defines the design system:
-
-```js
-colors: {
-  background: '#080808',   // near-black canvas
-  surface:   '#111111',   // elevated surfaces
-  surface2:  '#161616',   // deeper surfaces
-  onSurface: '#F5F2EB',  // warm white text
-  muted:     '#5A5A5A',  // secondary text
-  accent:    '#C8F23A',  // neon chartreuse accent
-  border:    '#1E1E1E',  // subtle borders
-}
+3. Start the development server:
+```bash
+npm run dev
 ```
 
-The **.env** file is ready for environment variables — extend it for YouTube API keys, database paths, etc.
-
----
-
-## ✦ Documentation
-
-| Document | Description |
-|---|---|
-| `repo/AUTOMIX_ENGINE.md` | **Deep dive into the AutoMix engine** — BPM detection, phrase snapping, transition tiers, EQ wiping, harmonic mixing |
-| `repo/ARCHITECTURE.md` | System architecture, data flow, threading model, deployment notes |
-
----
-
-```
-╔══════════════════════════════════════════════════════╗
-║  Made with ☕, code, and late‑night bass by HPS Labs ║
-║  ─── Reverie v0.0.1 ───                              ║
-╚══════════════════════════════════════════════════════╝
+4. Run backend server:
+```bash
+python server.py
 ```
 
+## 📊 Audio Processing Pipeline
+
+### Backend Analysis
+1. **Feature Extraction**: 13-dimensional feature vector (12 chroma + spectral centroid) + BPM = 14 dimensions for similarity search
+2. **BPM Normalization**: 60-200 BPM range normalized to 70-140 range matching AutoMix frontend
+3. **Similarity Matching**: Cosine similarity with BPM compatibility filtering
+
+### Frontend Analysis
+1. **Multi-window BPM Detection**: 4 different window sizes for consensus algorithm
+2. **Key Detection**: Camelot Wheel mapping using Goertzel-based chroma analysis
+3. **Energy Drop Detection**: Identifies optimal mix points in tracks
+4. **Safe Offset Detection**: Avoids silence and low-energy sections
+
+## 🔧 Configuration
+
+The application uses SQLite for data persistence and supports:
+- Multiple scanned music folders
+- User accounts with authentication
+- Playlist management
+- Listening history tracking
+- Language preferences
+
+## 🎯 Technical Highlights
+
+### Audio Analysis Architecture
+- **Multi-window BPM Detection**: 4 different time windows to ensure BPM accuracy
+- **Consensus Algorithm**: Filters out outliers and calculates median BPM
+- **Key Detection**: Uses Goertzel algorithm for efficient chroma vector calculation
+- **Energy Analysis**: RMS-based energy calculation for dynamic EQ decisions
+
+### AutoMix Engine Architecture
+- **Sample-Accurate Timing**: AudioBufferSourceNode architecture ensures precise timing
+- **3-Band EQ Wiping**: Low/Mid/High frequency bands processed independently during transitions
+- **Playback Rate Automation**: Native Web Audio API automation instead of JavaScript hacks
+- **Beat-Synced Transitions**: Synchronized with musical beats for seamless mixing
+
+### YouTube Integration Architecture
+- **yt-dlp Integration**: Uses yt-dlp with Node.js runtime support
+- **Analysis-Aware Ranking**: Scores tracks by compatibility when cached analysis is available
+- **Background Prefetching**: Downloads and analyzes upcoming tracks in background
+- **Fallback Mechanisms**: Manual YTM API as backup when yt-dlp fails
+
+## 📚 API Endpoints
+
+### Authentication
+- `POST /api/auth/signup` - Create new user account
+- `POST /api/auth/login` - Login with email/password
+- `POST /api/auth/logout` - Logout user
+- `GET /api/auth/me` - Get current user info
+
+### Music Library
+- `GET /api/tracks` - Get all tracks in library
+- `GET /api/search` - Search tracks by query
+- `GET /api/stream/{track_id}` - Stream a track
+- `POST /api/scan` - Scan music folders for new tracks
+- `POST /api/analyze` - Analyze tracks for audio features
+
+### User Data
+- `GET /api/liked-songs` - Get liked songs
+- `POST /api/liked-songs` - Add song to liked list
+- `DELETE /api/liked-songs/{track_id}` - Remove song from liked list
+- `GET /api/history` - Get listening history
+- `POST /api/history` - Add entry to history
+- `GET /api/user/settings` - Get user settings
+- `PUT /api/user/settings` - Update user settings
+
+### Playlists
+- `GET /api/playlists` - Get all playlists
+- `POST /api/playlists` - Create new playlist
+- `DELETE /api/playlists/{playlist_id}` - Delete playlist
+- `GET /api/playlists/{playlist_id}/tracks` - Get tracks in playlist
+- `POST /api/playlists/{playlist_id}/tracks` - Add track to playlist
+- `DELETE /api/playlists/{playlist_id}/tracks/{track_id}` - Remove track from playlist
+
+### YouTube Integration
+- `POST /api/download` - Download YouTube audio
+- `POST /api/youtube/extract` - Extract playlist or video info from URL
+- `POST /api/youtube/playlist/import` - Import YouTube playlist to local library
+- `GET /api/queue/next` - Get next queue of tracks for AutoMix
+- `GET /api/search` - Search YouTube videos
+
+## 🎨 UI Components
+
+### Core Screens
+- Home Screen: Main dashboard with recommendations and recently played
+- Library Screen: Browse local music library
+- Now Playing Screen: Audio playback controls with visualizer
+- Queue Screen: View and manage AutoMix queue
+- Search Screen: Search local library and YouTube
+- Settings Screen: User preferences and system settings
+
+### UI Features
+- Dark theme with custom Tailwind CSS styling
+- Responsive design for desktop usage
+- Animated transitions using Framer Motion
+- Drag-and-drop playlist management
+- Context menus for track actions
+- Progress indicators and visual feedback
+
+## 🧠 Intelligent Recommendations
+
+The recommendation engine uses a hybrid approach:
+1. **Similarity-based (Exploitation)**: Uses cosine similarity with BPM compatibility filtering
+2. **Exploration**: Fallback to weighted random selection when no history exists
+3. **Epsilon-Greedy Algorithm**: Balances between exploring new tracks and playing familiar ones
+
+## 🔒 Security Considerations
+
+- Passwords are hashed using SHA-256
+- Session management with UUID tokens
+- Database schema designed to prevent injection attacks
+- Input validation for all API endpoints
+
+## 🚨 Known Limitations
+
+1. Windows-specific Node.js path handling in yt-dlp integration
+2. Limited fallback options when yt-dlp fails
+3. Audio analysis performance on very large libraries
+4. Browser-based audio processing limitations
+
+## 📈 Performance Optimization
+
+- Caching of analysis results for frequently accessed tracks
+- Background processing for library scanning and analysis
+- Efficient database queries with proper indexing
+- Lazy loading of UI components for better startup performance
+
+## 🧪 Testing
+
+The application includes:
+- Unit tests for audio analysis algorithms
+- Integration tests for API endpoints
+- End-to-end tests for frontend components
+- Performance benchmarks for audio processing
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create your feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a new Pull Request
+
+## 📄 License
+
+MIT License - see LICENSE file for details.
+
 ---
 
-*Reverie is an open‑source project. Contributions, forks, and late‑night feature experiments are welcome.*
+*Reverie — HPS Labs | Self-hosted music player with intelligent auto-mixing*

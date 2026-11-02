@@ -5,6 +5,9 @@ import hashlib
 import uuid
 from datetime import datetime
 
+# Max listening-history entries retained per user (newest kept).
+HISTORY_LIMIT = 30
+
 class DatabaseManager:
     def __init__(self, db_path="database/music_player.db"):
         self.db_path = db_path
@@ -197,6 +200,19 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
+    def get_or_create_guest_user(self):
+        guest_email = 'guest@reverie.local'
+        user = self.get_user_by_email(guest_email)
+        if user:
+            return {"id": user["id"], "email": user["email"]}
+        created = self.create_user(guest_email, 'guest')
+        if created:
+            return created
+        user = self.get_user_by_email(guest_email)
+        if user:
+            return {"id": user["id"], "email": user["email"]}
+        return None
+
     # ─── Liked Songs ────────────────────────────────────────────
 
     def get_liked_songs(self, user_id):
@@ -246,13 +262,20 @@ class DatabaseManager:
                 "INSERT INTO listening_history (user_id, track_id, metadata) VALUES (?, ?, ?)",
                 (user_id, track_id, json.dumps(metadata))
             )
+            # Cap history: keep only the newest HISTORY_LIMIT entries per user
+            # so the DB does not grow unbounded over time.
+            cursor.execute(
+                "DELETE FROM listening_history WHERE id NOT IN "
+                "(SELECT id FROM listening_history WHERE user_id = ? ORDER BY id DESC LIMIT ?)",
+                (user_id, HISTORY_LIMIT)
+            )
             conn.commit()
         except sqlite3.Error as e:
             print(f"Add history error: {e}")
         finally:
             conn.close()
 
-    def get_listening_history(self, user_id, limit=50):
+    def get_listening_history(self, user_id, limit=HISTORY_LIMIT):
         conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -275,6 +298,35 @@ class DatabaseManager:
             return {"id": str(pid), "name": name, "user_id": str(user_id), "created_at": datetime.now().isoformat(), "thumbnail": None}
         except sqlite3.Error as e:
             print(f"Create playlist error: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def create_playlist_with_tracks(self, user_id, name, tracks):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO playlists (user_id, name) VALUES (?, ?)", (user_id, name))
+            playlist_id = cursor.lastrowid
+            for idx, track in enumerate(tracks):
+                track_id = str(track.get("id") or uuid.uuid4())
+                cursor.execute(
+                    "INSERT INTO playlist_tracks (playlist_id, track_id, metadata, position) VALUES (?, ?, ?, ?)",
+                    (playlist_id, track_id, json.dumps(track), idx)
+                )
+            conn.commit()
+            first_thumb = tracks[0].get("thumbnail") if tracks else None
+            return {
+                "id": str(playlist_id),
+                "name": name,
+                "user_id": str(user_id),
+                "created_at": datetime.now().isoformat(),
+                "thumbnail": first_thumb,
+                "track_count": len(tracks)
+            }
+        except sqlite3.Error as e:
+            print(f"Create playlist with tracks error: {e}")
+            conn.rollback()
             return None
         finally:
             conn.close()
@@ -569,3 +621,4 @@ class DatabaseManager:
             return False
         finally:
             conn.close()
+            
