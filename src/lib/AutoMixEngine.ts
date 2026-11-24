@@ -19,11 +19,17 @@ declare global {
   }
 }
 
+// Krumhansl–Kessler tonal hierarchies, index 0 = tonic.
+const KEY_PROFILE_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KEY_PROFILE_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
 export class AutoMixEngine {
   context: AudioContext | null = null;
   deckA: DeckState | null = null;
   deckB: DeckState | null = null;
   private impulseBuffer: AudioBuffer | null = null;
+  masterGain: GainNode | null = null;
+  masterLimiter: DynamicsCompressorNode | null = null;
   onDeckEnded: ((deck: DeckState) => void) | null = null;
 
   // ═══════════════════════════════════════
@@ -37,6 +43,22 @@ export class AutoMixEngine {
   init(): void {
     if (!this.context) {
       this.context = new AudioContext();
+    }
+
+    if (!this.masterGain) {
+      this.masterGain = this.context.createGain();
+      this.masterGain.gain.value = 1.0;
+    }
+
+    if (!this.masterLimiter) {
+      this.masterLimiter = this.context.createDynamicsCompressor();
+      this.masterLimiter.threshold.value = -1.0;
+      this.masterLimiter.knee.value = 0;
+      this.masterLimiter.ratio.value = 20;
+      this.masterLimiter.attack.value = 0.003;
+      this.masterLimiter.release.value = 0.15;
+      this.masterGain.connect(this.masterLimiter);
+      this.masterLimiter.connect(this.context.destination);
     }
 
     if (!this.impulseBuffer) {
@@ -118,12 +140,12 @@ export class AutoMixEngine {
     eqMid.connect(eqHigh);
     eqHigh.connect(gain);
     gain.connect(filter);
-    filter.connect(ctx.destination);
+    filter.connect(this.masterGain!);
 
     // Parallel reverb path
     filter.connect(convolver);
     convolver.connect(reverbGain);
-    reverbGain.connect(ctx.destination);
+    reverbGain.connect(this.masterGain!);
 
     return {
       audioBuffer: null,
@@ -182,6 +204,21 @@ export class AutoMixEngine {
       } catch {}
     }
 
+    // Solo playback uses the same loudness gain as transitions. Also reset any
+    // EQ left over from a previous outgoing fade so direct starts aren't muffled.
+    const now = this.context.currentTime;
+    const soloGain = deck.analysis?.normalGain ?? 1;
+    deck.gain.gain.cancelScheduledValues(now);
+    deck.gain.gain.setValueAtTime(soloGain, now);
+    deck.eqLow.gain.cancelScheduledValues(now);
+    deck.eqLow.gain.setValueAtTime(0, now);
+    deck.eqMid.gain.cancelScheduledValues(now);
+    deck.eqMid.gain.setValueAtTime(0, now);
+    deck.eqHigh.gain.cancelScheduledValues(now);
+    deck.eqHigh.gain.setValueAtTime(0, now);
+    deck.filter.frequency.cancelScheduledValues(now);
+    deck.filter.frequency.setValueAtTime(20000, now);
+
     // Create new source
     const source = this.context.createBufferSource();
     source.buffer = deck.audioBuffer;
@@ -216,7 +253,7 @@ export class AutoMixEngine {
   pause(deck: DeckState): void {
     if (!deck.sourceNode || !this.context || !deck.isPlaying) return;
 
-    const elapsed = this.context.currentTime - deck.startTime;
+    const elapsed = Math.max(0, this.context.currentTime - deck.startTime);
     deck.startOffset += elapsed;
 
     try {
@@ -245,7 +282,8 @@ export class AutoMixEngine {
    */
   getCurrentPlaybackTime(deck: DeckState): number {
     if (!deck.isPlaying || !this.context) return deck.startOffset;
-    return deck.startOffset + (this.context.currentTime - deck.startTime);
+    const elapsed = Math.max(0, this.context.currentTime - deck.startTime);
+    return deck.startOffset + elapsed;
   }
 
   // ═══════════════════════════════════════
@@ -262,17 +300,30 @@ export class AutoMixEngine {
     let mixPointAt: number | null = null;
     let confidence = 0;
     let energy = 0;
-    let key = '8B'; // Default: C Major
+    let key = ''; // '' = unknown
+    let keyConfidence = 0;
+    let bpmRaw = 0;
+    let bpmConfidenceRaw = 0;
+    let bpmAgreement = 0;
+    let bpmSource: 'detector' | 'metadata' | 'none' = 'none';
+    let bpmWindowCount = 0;
+    let bpmWindowsTotal = 0;
+    let windowBpms: number[] = [];
+    let mixLocalRatio = 1;
+    let loudnessDb = -16;
+    let normalGain = 1;
     let rmsAtMixPoint = 0;
     let avgRMS = 0;
     let bpmRange = 0;
     let bpmReliable = false;
     let analysisFallback = false;
 
+    let beatOffset = 0;
+    const safeOffsets = this.detectSafeOffsets(buffer);
+
     console.log(`[AutoMix] High-precision analysis (4-window BPM + Key detection + Energy Drop)...`);
 
-    const normalizedResults: number[] = [];
-    const confidenceResults: number[] = [];
+    const windowResults: { offset: number; bpm: number; conf: number }[] = [];
 
     try {
       // ═══ BPM Detection (4-window consensus) ═══
@@ -281,13 +332,8 @@ export class AutoMixEngine {
       for (const offset of windows) {
         const { bpm: winBPM, confidence: winConf } = this.detectBPMFromBuffer(buffer, offset);
         if (winBPM > 0) {
-          const normalized = this.normalizeBPM(winBPM);
-          normalizedResults.push(normalized);
-          confidenceResults.push(winConf);
-
-          console.log(
-            `[AutoMix] Window at ${offset}s: ${winBPM.toFixed(2)} BPM (Conf: ${winConf.toFixed(2)}, StartSample: ${Math.floor(offset * buffer.sampleRate)})`
-          );
+          windowResults.push({ offset, bpm: winBPM, conf: winConf });
+          console.log(`[AutoMix] Window at ${offset}s: ${winBPM.toFixed(2)} BPM (Conf: ${winConf.toFixed(2)})`);
         }
       }
 
@@ -301,41 +347,73 @@ export class AutoMixEngine {
         count++;
       }
       energy = Math.sqrt(sumSq / count);
+      loudnessDb = 20 * Math.log10(Math.max(1e-6, energy));
+      // Target -14 dBFS RMS. Clamp so quiet masters boost ≤1.5x, hot masters cut ≤0.5x.
+      normalGain = Math.max(0.5, Math.min(1.5, Math.pow(10, (-14 - loudnessDb) / 20)));
 
-      if (normalizedResults.length > 0) {
-        // 1. Calculate base median
-        const sorted = [...normalizedResults].sort((a, b) => a - b);
-        const baseMedian = sorted[Math.floor((sorted.length - 1) / 2)];
+      if (windowResults.length > 0) {
+        // Reference octave: median of independently normalized windows.
+        const normAll = windowResults.map(w => this.normalizeBPM(w.bpm)).sort((a, b) => a - b);
+        const reference = normAll[Math.floor((normAll.length - 1) / 2)];
 
-        // 2. Filter out outliers (median ±10 BPM)
-        const filteredIndices = normalizedResults
-          .map((b, i) => (Math.abs(b - baseMedian) < 10 ? i : -1))
-          .filter((i) => i !== -1);
+        // Fold each RAW window to the octave closest to the reference BEFORE
+        // median/agreement. This prevents half/double windows from collapsing
+        // the outlier filter down to a single survivor.
+        const folded = windowResults.map(w => {
+          const candidates = [w.bpm * 0.5, w.bpm, w.bpm * 2].filter(v => v >= 55 && v <= 200);
+          let best = candidates[0] ?? w.bpm;
+          let bestD = Math.abs(best - reference);
+          for (const c of candidates) {
+            const d = Math.abs(c - reference);
+            if (d < bestD) { bestD = d; best = c; }
+          }
+          return { bpm: best, conf: w.conf };
+        });
 
-        const filteredBPMs = filteredIndices.map((i) => normalizedResults[i]);
-        const filteredConfs = filteredIndices.map((i) => confidenceResults[i]);
+        const foldedSorted = folded.map(f => f.bpm).sort((a, b) => a - b);
+        const baseMedian = foldedSorted[Math.floor((foldedSorted.length - 1) / 2)];
+        const filtered = folded.filter(f => Math.abs(f.bpm - baseMedian) < 10);
 
-        // 3. Final BPM and Confidence
+        const filteredBPMs = filtered.map(f => f.bpm);
+        const filteredConfs = filtered.map(f => f.conf);
         const filteredSorted = [...filteredBPMs].sort((a, b) => a - b);
         bpm = filteredSorted[Math.floor(filteredSorted.length / 2)];
-        confidence = filteredConfs.reduce((a, b) => a + b, 0) / filteredConfs.length;
+        bpmRaw = bpm;
 
-        // BPM consensus floor:
-        // If multiple analysis windows agree closely, do not let confidence collapse.
-        const range = Math.max(...filteredSorted) - Math.min(...filteredSorted);
-        let consensusFloor = 0;
+        const rawConf = filteredConfs.reduce((a, b) => a + b, 0) / Math.max(1, filteredConfs.length);
+        const range = filteredSorted.length > 0
+          ? Math.max(...filteredSorted) - Math.min(...filteredSorted)
+          : 0;
+        const windowCount = filteredBPMs.length;
 
-        if (filteredBPMs.length >= 2) {
-          if (range <= 2) {
-            consensusFloor = 0.72;
-          } else if (range <= 5) {
-            consensusFloor = 0.58;
-          } else if (range <= 10) {
-            consensusFloor = 0.45;
-          }
+        let agreement = 0;
+        if (windowCount >= 2) {
+          agreement = Math.max(0, 1 - range / 12);
+          if (windowCount < 3) agreement *= 0.85;
+          confidence = Math.min(1, rawConf * 0.55 + agreement * 0.45);
+          confidence = Math.min(confidence, Math.max(rawConf, agreement * 0.75));
+        } else {
+          // Single surviving window: lower trust, but NOT near-zero.
+          agreement = 0;
+          confidence = Math.min(0.60, rawConf * 0.75 + 0.25);
         }
 
-        confidence = Math.max(confidence, consensusFloor);
+        // Evidence-gated floor: tight agreement across >=2 folded windows is real
+        // evidence even when raw autocorrelation peak/variance is modest.
+        // This is NOT the old synthetic floor: it requires octave-folded consensus
+        // and window count, and it cannot reach PERFECT (0.70) by itself.
+        if (windowCount >= 3 && range <= 2) {
+          confidence = Math.max(confidence, 0.65);
+        } else if (windowCount >= 2 && range <= 2) {
+          confidence = Math.max(confidence, 0.58);
+        }
+
+        bpmConfidenceRaw = rawConf;
+        bpmAgreement = agreement;
+        bpmWindowCount = windowCount;
+        bpmWindowsTotal = windowResults.length;
+        windowBpms = filteredBPMs;
+        bpmSource = 'detector';
 
       // 4. Tempo Variable Check
       bpmRange = range;
@@ -352,73 +430,73 @@ export class AutoMixEngine {
         );
 
         // ═══ Mix Point Detection ═══
-        const result = this.detectMixPoint(buffer, bpm);
+        // Normalize BEFORE comb + mix-point so the comb period and barDuration agree.
+        bpm = this.normalizeBPM(bpm);
+        beatOffset = this.detectBeatOffset(buffer, bpm);
+        const result = this.detectMixPoint(buffer, bpm, beatOffset, safeOffsets.audibleEndAt);
         mixPointAt = result.mixPoint;
         rmsAtMixPoint = result.rmsAtMixPoint;
         avgRMS = result.avgRMS;
+        mixLocalRatio = result.localDropRatio;
 
         console.log(`[AutoMix] Mix point (Energy Drop) at: ${mixPointAt.toFixed(2)}s`);
       }
 
       // ═══ Key Detection (NEW: Camelot Wheel) ═══
-      key = await this.detectKey(buffer);
-      console.log(`[AutoMix] Key: ${key} (Harmonic Compatibility)`);
+      const keyResult = await this.detectKey(buffer);
+      key = keyResult.key;
+      keyConfidence = keyResult.confidence;
+      console.log(`[AutoMix] Key: ${key || 'unknown'} (conf ${keyConfidence.toFixed(2)})`);
 } catch (e) {
     console.error('[AutoMix] Analysis failed:', e);
     analysisFallback = true;
     if (fallbackBpm && fallbackBpm > 0) {
       bpm = fallbackBpm;
-      confidence = 0.65;
+      confidence = 0.60;
       bpmReliable = true;
+      bpmSource = 'metadata';
     } else {
       bpm = 0;
       confidence = 0.15;
       bpmReliable = false;
+      bpmSource = 'none';
     }
-    key = '8B';
+    key = '';
+    keyConfidence = 0;
   }
 
   if (!bpmReliable && !analysisFallback) {
     analysisFallback = true;
     if (fallbackBpm && fallbackBpm > 0) {
       bpm = fallbackBpm;
-      confidence = 0.65;
+      confidence = 0.60;
       bpmReliable = true;
+      bpmSource = 'metadata';
     } else {
       bpm = 0;
       confidence = 0.15;
       bpmReliable = false;
+      bpmSource = 'none';
     }
   }
 
   if (bpm > 0) {
+    if (bpmRaw === 0) bpmRaw = bpm;
     bpm = this.normalizeBPM(bpm);
   }
-    const beatOffset = this.detectBeatOffset(buffer);
-
-    // Snap mix point to 8-bar phrase boundary
-    if (mixPointAt !== null) {
-      const barDuration = (60 / bpm) * 4;
-      const phraseLength = barDuration * 8;
-
-      const phrasesSinceStart = Math.round((mixPointAt - beatOffset) / phraseLength);
-      const snappedMixPoint = beatOffset + phrasesSinceStart * phraseLength;
-
-      if (snappedMixPoint > beatOffset && snappedMixPoint < buffer.duration - barDuration * 4) {
-        console.log(`[AutoMix] Mix Point Snapped: ${mixPointAt.toFixed(2)}s -> ${snappedMixPoint.toFixed(2)}s`);
-        mixPointAt = snappedMixPoint;
-      }
-    }
-
-    const barDuration = (60 / bpm) * 4;
+  if (beatOffset === 0 && bpm > 0) {
+    beatOffset = this.detectBeatOffset(buffer, bpm);
+  }
+    // beatOffset and safeOffsets were computed early. detectMixPoint is already
+    // grid-aligned to beatOffset, so no second competing phrase re-snap here.
+    const barDuration = bpm > 0 ? (60 / bpm) * 4 : 2;
     const overlapBars = mixPointAt
-      ? Math.min(16, Math.max(4, Math.floor((buffer.duration - mixPointAt) / barDuration)))
+      ? Math.min(16, Math.max(4, Math.floor((safeOffsets.audibleEndAt - mixPointAt) / barDuration)))
       : 8;
-
-    const safeOffsets = this.detectSafeOffsets(buffer);
 
     return {
       bpm,
+      bpmRaw,
       tempoVariable,
       mixPointAt,
       overlapBars,
@@ -426,6 +504,16 @@ export class AutoMixEngine {
       energy,
       confidence,
       key,
+      keyConfidence,
+      bpmConfidenceRaw,
+      bpmAgreement,
+      bpmSource,
+      bpmWindowCount,
+      bpmWindowsTotal,
+      windowBpms,
+      mixLocalRatio,
+      loudnessDb,
+      normalGain,
       rmsAtMixPoint,
       avgRMS,
       bpmReliable,
@@ -440,25 +528,22 @@ export class AutoMixEngine {
   }
 
   /**
-   * Detects the musical key of a track using a Goertzel-based chroma vector.
-   * Maps the result to a Camelot Wheel code (e.g., "8B" for C Major).
+   * Detects the musical key using a Goertzel chroma vector correlated against
+   * the Krumhansl–Kessler major/minor profiles for all 24 keys.
+   * Maps the winner to a Camelot Wheel code (e.g., "8B" for C Major).
    */
-  private async detectKey(buffer: AudioBuffer): Promise<string> {
-    // Use the first 30 seconds for key detection (usually the most harmonically stable)
+  private async detectKey(buffer: AudioBuffer): Promise<{ key: string; confidence: number }> {
     const sampleRate = buffer.sampleRate;
     const duration = Math.min(30, buffer.duration);
     const length = Math.floor(duration * sampleRate);
     const channelData = buffer.getChannelData(0).slice(0, length);
 
-    // Chroma vector (12 semitones)
     const chroma = new Array(12).fill(0);
     const noteFrequencies = [
       261.63, 277.18, 293.66, 311.13, 329.63, 349.23,
-      369.99, 392.00, 415.30, 440.00, 466.16, 493.88 // C4 to B4
+      369.99, 392.00, 415.30, 440.00, 466.16, 493.88
     ];
 
-    // Calculate energy for each pitch class using a simplified Goertzel filter
-    // We analyze in 1-second windows to smooth out transients
     const windowSize = sampleRate;
     const numWindows = Math.floor(length / windowSize);
 
@@ -467,33 +552,61 @@ export class AutoMixEngine {
       const end = start + windowSize;
       const windowData = channelData.slice(start, end);
 
-      for (let oct = 0; oct < 3; oct++) { // Check 3 octaves
+      for (let oct = 0; oct < 3; oct++) {
         for (let note = 0; note < 12; note++) {
-          const freq = noteFrequencies[note] * Math.pow(2, oct - 1); // Down 1 octave, up 1
-          const energyVal = this.goertzelEnergy(windowData, sampleRate, freq);
-          chroma[note] += energyVal;
+          const freq = noteFrequencies[note] * Math.pow(2, oct - 1);
+          chroma[note] += this.goertzelEnergy(windowData, sampleRate, freq);
         }
       }
     }
 
-    // Normalize chroma vector
     const maxChroma = Math.max(...chroma);
-    if (maxChroma > 0) {
-      for (let i = 0; i < 12; i++) chroma[i] /= maxChroma;
+    if (maxChroma <= 1e-6) return { key: '', confidence: 0 };
+
+    for (let i = 0; i < 12; i++) chroma[i] /= maxChroma;
+
+    const sorted = [...chroma].sort((a, b) => b - a);
+    if (sorted[0] - sorted[1] <= 1e-6) return { key: '', confidence: 0 };
+
+    const meanChroma = chroma.reduce((a, b) => a + b, 0) / 12;
+    let best = { tonic: 0, mode: 'major' as 'major' | 'minor', corr: -1 };
+    let secondCorr = -1;
+
+    for (const profile of [
+      { mode: 'major' as const, values: KEY_PROFILE_MAJOR },
+      { mode: 'minor' as const, values: KEY_PROFILE_MINOR },
+    ]) {
+      const meanProfile = profile.values.reduce((a, b) => a + b, 0) / 12;
+      for (let tonic = 0; tonic < 12; tonic++) {
+        let num = 0;
+        let dC = 0;
+        let dP = 0;
+        for (let pc = 0; pc < 12; pc++) {
+          const dc = chroma[pc] - meanChroma;
+          const dp = profile.values[(pc - tonic + 12) % 12] - meanProfile;
+          num += dc * dp;
+          dC += dc * dc;
+          dP += dp * dp;
+        }
+        const corr = dC > 1e-9 && dP > 1e-9 ? num / Math.sqrt(dC * dP) : -1;
+        if (corr > best.corr) {
+          secondCorr = best.corr;
+          best = { tonic, mode: profile.mode, corr };
+        } else if (corr > secondCorr) {
+          secondCorr = corr;
+        }
+      }
     }
 
-    // Find the dominant note
-    const dominantNote = chroma.indexOf(Math.max(...chroma));
+    if (best.corr < 0) return { key: '', confidence: 0 };
+    // Confidence from profile fit plus margin over the runner-up key.
+    const margin = Math.max(0, best.corr - secondCorr);
+    const confidence = Math.max(0, Math.min(1, best.corr * 0.65 + margin * 0.35));
+    // Weak profile fits are noise; stay neutral rather than guess.
+    if (best.corr < 0.30 || confidence < 0.10) return { key: '', confidence };
+
     const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-
-    // Determine Major/Minor (simplified: check if the 3rd or minor 3rd is stronger)
-    // Major 3rd is +4 semitones, Minor 3rd is +3 semitones
-    const major3rd = chroma[(dominantNote + 4) % 12];
-    const minor3rd = chroma[(dominantNote + 3) % 12];
-    const mode = major3rd > minor3rd ? 'major' : 'minor';
-
-    // Map to Camelot Wheel
-    return this.noteToCamelot(noteNames[dominantNote], mode);
+    return { key: this.noteToCamelot(noteNames[best.tonic], best.mode), confidence };
   }
 
   /**
@@ -536,27 +649,81 @@ export class AutoMixEngine {
       'B':   { major: '1B',  minor: '10A' },
     };
 
-    return camelotMap[note]?.[mode] || '8B';
+    return camelotMap[note]?.[mode] || '';
   }
 
   /**
-   * Detects the first strong downbeat in the track.
+   * Comb-filter beat/bar-phase detector.
+   * Instead of "first transient = downbeat", find the phase whose beat grid
+   * accumulates the most onset novelty, then pick the strongest bar phase.
    */
-  private detectBeatOffset(buffer: AudioBuffer): number {
+  private detectBeatOffset(buffer: AudioBuffer, bpm = 0): number {
     const sampleRate = buffer.sampleRate;
-    const analysisLength = Math.min(buffer.length, sampleRate * 15);
+    const analysisLength = Math.min(buffer.length, sampleRate * 30);
     const data = buffer.getChannelData(0).slice(0, analysisLength);
-
     const envelope = this.computeEnergyEnvelope(data, sampleRate, 0.01);
-    const avgEnergy = envelope.reduce((a, b) => a + b, 0) / envelope.length;
-    const threshold = avgEnergy * 1.5;
+    if (envelope.length < 8) return 0;
 
-    for (let i = 1; i < envelope.length - 1; i++) {
-      if (envelope[i] > threshold && envelope[i] > envelope[i - 1] && envelope[i] > envelope[i + 1]) {
-        return i * 0.01;
+    // Half-wave rectified energy flux = onset novelty.
+    const novelty = new Float32Array(envelope.length);
+    for (let i = 1; i < envelope.length; i++) {
+      novelty[i] = Math.max(0, envelope[i] - envelope[i - 1]);
+    }
+
+    // Fallback for unknown BPM: old first-peaks heuristic.
+    if (!bpm || bpm <= 0) {
+      const avg = envelope.reduce((a, b) => a + b, 0) / envelope.length;
+      const th = avg * 1.5;
+      for (let i = 1; i < envelope.length - 1; i++) {
+        if (envelope[i] > th && envelope[i] > envelope[i - 1] && envelope[i] > envelope[i + 1]) {
+          return i * 0.01;
+        }
+      }
+      return 0;
+    }
+
+    const hop = 0.01;
+    const beatFrames = Math.max(1, Math.round((60 / bpm) / hop));
+
+    // 1) Beat phase: comb over up to 16 beats.
+    let bestPhase = 0;
+    let bestPhaseScore = -1;
+    for (let phase = 0; phase < beatFrames && phase < novelty.length; phase++) {
+      let sum = 0, count = 0;
+      for (let k = 0; k < 16; k++) {
+        const idx = phase + k * beatFrames;
+        if (idx >= novelty.length) break;
+        sum += novelty[idx];
+        count++;
+      }
+      const score = count > 0 ? sum / count : 0;
+      if (score > bestPhaseScore) {
+        bestPhaseScore = score;
+        bestPhase = phase;
       }
     }
-    return 0;
+
+    // 2) Bar phase: among the 4 beats, pick the one with strongest bar-periodic onsets.
+    let bestOffset = bestPhase;
+    let bestBarScore = -1;
+    for (let b = 0; b < 4; b++) {
+      const off = bestPhase + b * beatFrames;
+      if (off >= novelty.length) break;
+      let sum = 0, count = 0;
+      for (let k = 0; k < 8; k++) {
+        const idx = off + k * 4 * beatFrames;
+        if (idx >= novelty.length) break;
+        sum += novelty[idx];
+        count++;
+      }
+      const score = count > 0 ? sum / count : 0;
+      if (score > bestBarScore) {
+        bestBarScore = score;
+        bestOffset = off;
+      }
+    }
+
+    return bestOffset * hop;
   }
 
   /**
@@ -642,14 +809,17 @@ export class AutoMixEngine {
   /**
    * Detects the best mix point (energy drop or outro) in the track.
    */
-  private detectMixPoint(buffer: AudioBuffer, bpm: number): { mixPoint: number; rmsAtMixPoint: number; avgRMS: number } {
-    const barDuration = (60 / bpm) * 4;
-    const phraseLength = barDuration * 8;
-    const analysisStart = buffer.duration * 0.85;
+  private detectMixPoint(
+    buffer: AudioBuffer,
+    bpm: number,
+    beatOffset: number,
+    audibleEndAt: number
+  ): { mixPoint: number; rmsAtMixPoint: number; avgRMS: number; localDropRatio: number } {
+    const barDuration = bpm > 0 ? (60 / bpm) * 4 : 2;
     const channelData = buffer.getChannelData(0);
     const sampleRate = buffer.sampleRate;
 
-    const frameSize = Math.floor(sampleRate * 0.05);
+    const frameSize = Math.max(1, Math.floor(sampleRate * 0.05));
     const totalFrames = Math.floor(channelData.length / frameSize);
     const energyArr = new Float32Array(totalFrames);
     let totalEnergySum = 0;
@@ -659,48 +829,90 @@ export class AutoMixEngine {
       const end = Math.min(start + frameSize, channelData.length);
       let sum = 0;
       for (let i = start; i < end; i++) sum += channelData[i] * channelData[i];
-      energyArr[f] = Math.sqrt(sum / (end - start));
+      energyArr[f] = Math.sqrt(sum / Math.max(1, end - start));
       totalEnergySum += energyArr[f];
     }
 
-    const avgRMS = totalEnergySum / totalFrames;
-    const twoBarFrames = Math.round((barDuration * 2) / 0.05);
-    const defaultFallback = buffer.duration - phraseLength;
+    const avgRMS = totalEnergySum / Math.max(1, totalFrames);
+    const twoBarFrames = Math.max(1, Math.round((barDuration * 2) / 0.05));
+    const localFrames = Math.max(1, Math.round((barDuration * 8) / 0.05));
+
+    const windowRMSAt = (t: number): number => {
+      const frame = Math.floor(t / 0.05);
+      if (frame < 0 || frame + twoBarFrames >= totalFrames) return avgRMS;
+      let s = 0;
+      for (let f = frame; f < frame + twoBarFrames; f++) s += energyArr[f] * energyArr[f];
+      return Math.sqrt(s / twoBarFrames);
+    };
+
+    // Local baseline = mean RMS of the preceding 8 bars. A drop from a loud
+    // section into a quieter outro is a good exit even if still above global avg.
+    const localBaselineAt = (t: number): number => {
+      const frame = Math.floor(t / 0.05);
+      const start = Math.max(0, frame - localFrames);
+      if (frame <= 0 || frame <= start) return avgRMS;
+      let s = 0;
+      for (let f = start; f < frame; f++) s += energyArr[f];
+      return s / (frame - start);
+    };
+
+    const endLimit = Math.max(0, audibleEndAt - 4 * barDuration - 0.25);
+    const searchStart = Math.max(beatOffset + 8 * barDuration, buffer.duration * 0.60);
+    const span = Math.max(0.001, endLimit - searchStart);
+    const step = barDuration * 2; // finer 2-bar candidates
 
     let bestScore = Infinity;
-    let bestMixPoint = defaultFallback;
+    let bestMixPoint = -1;
     let bestRMS = avgRMS;
-    const endLimit = buffer.duration - barDuration * 4;
+    let bestLocalDrop = 1;
 
-    for (let t = analysisStart; t < endLimit; t += barDuration) {
-      const frame = Math.floor(t / 0.05);
-      if (frame + twoBarFrames >= totalFrames) break;
+    const scoreAt = (t: number) => {
+      const wrms = windowRMSAt(t);
+      const globalRatio = avgRMS > 0 ? wrms / avgRMS : 1;
+      const localBase = localBaselineAt(t);
+      const localDrop = localBase > 1e-6 ? wrms / localBase : 1;
 
-      let windowRMS = 0;
-      for (let f = frame; f < frame + twoBarFrames; f++) windowRMS += energyArr[f] * energyArr[f];
-      windowRMS = Math.sqrt(windowRMS / twoBarFrames);
+      const barsFromOrigin = (t - beatOffset) / barDuration;
+      const mod8 = ((barsFromOrigin % 8) + 8) % 8;
+      const distToPhrase = Math.min(mod8, 8 - mod8);
+      const is8 = distToPhrase < 0.01;
+      const is4 = Math.abs(distToPhrase - 4) < 0.01;
+      const alignmentPenalty = is8 ? 0 : is4 ? 0.05 : 0.15;
 
-      // Avoid vocal regions (high energy)
-      if (windowRMS > avgRMS * 0.8) continue;
+      const latenessPenalty = 0.25 * (1 - (t - searchStart) / span);
+      const runwayBars = (audibleEndAt - t) / barDuration;
+      const runwayPenalty = Math.max(0, (8 - runwayBars) / 8) * 0.3;
 
-      const nearestPhrase = Math.round(t / phraseLength) * phraseLength;
-      const penalty = Math.abs(t - nearestPhrase) / phraseLength;
-      const score = windowRMS + penalty;
+      // Local drop dominates; global ratio is a secondary term.
+      const energyTerm = Math.min(localDrop, 1.5) + 0.3 * Math.min(globalRatio, 1.5);
+      const score = energyTerm + latenessPenalty + runwayPenalty + alignmentPenalty;
+      return { score, wrms, localDrop };
+    };
 
-      if (score < bestScore) {
-        bestScore = score;
-        bestMixPoint = t;
-        bestRMS = windowRMS;
+    if (step > 0 && endLimit > searchStart) {
+      const first = beatOffset + Math.ceil((searchStart - beatOffset) / step) * step;
+      for (let t = first; t <= endLimit; t += step) {
+        const { score, wrms, localDrop } = scoreAt(t);
+        if (score < bestScore) {
+          bestScore = score;
+          bestMixPoint = t;
+          bestRMS = wrms;
+          bestLocalDrop = localDrop;
+        }
       }
     }
 
-    // Snap to phrase boundary
-    const snappedMixPoint = Math.round(bestMixPoint / phraseLength) * phraseLength;
-    if (Math.abs(snappedMixPoint - bestMixPoint) <= phraseLength) {
-      bestMixPoint = snappedMixPoint;
+    if (bestMixPoint < 0) {
+      const target = Math.max(beatOffset, audibleEndAt - 8 * barDuration);
+      const k = Math.floor((target - beatOffset) / Math.max(0.001, step));
+      bestMixPoint = Math.max(0, beatOffset + k * step);
+      const r = scoreAt(bestMixPoint);
+      bestRMS = r.wrms;
+      bestLocalDrop = r.localDrop;
     }
 
-    return { mixPoint: bestMixPoint, rmsAtMixPoint: bestRMS, avgRMS };
+    bestMixPoint = Math.min(bestMixPoint, endLimit);
+    return { mixPoint: bestMixPoint, rmsAtMixPoint: bestRMS, avgRMS, localDropRatio: bestLocalDrop };
   }
 
   /**
@@ -930,30 +1142,48 @@ export class AutoMixEngine {
   // ═══════════════════════════════════════
 
   /**
-   * Determines if two Camelot keys are harmonically compatible.
+   * Harmonic relation between two Camelot keys.
+   * Either key unknown OR below the confidence bar => 'unknown', never a match/clash.
    */
-  private isHarmonicallyCompatible(keyA: string, keyB: string): boolean {
-    if (keyA === keyB) return true; // Perfect match
+  private harmonicRelation(
+    keyA: string,
+    keyB: string,
+    confA: number,
+    confB: number
+  ): 'compatible' | 'incompatible' | 'unknown' {
+    const KEY_CONF_COMPAT = 0.25;
+    const KEY_CONF_CLASH = 0.35;
+
+    if (!keyA || !keyB || confA < KEY_CONF_COMPAT || confB < KEY_CONF_COMPAT) return 'unknown';
+    if (keyA === keyB) return 'compatible';
 
     const numA = parseInt(keyA.slice(0, -1));
     const letterA = keyA.slice(-1);
     const numB = parseInt(keyB.slice(0, -1));
     const letterB = keyB.slice(-1);
+    if (Number.isNaN(numA) || Number.isNaN(numB)) return 'unknown';
 
-    // Rule 1: Relative major/minor (same number, different letter)
-    if (numA === numB && letterA !== letterB) return true;
+    if (numA === numB && letterA !== letterB) return 'compatible';
+    if (letterA === letterB && (Math.abs(numA - numB) === 1 || Math.abs(numA - numB) === 11)) return 'compatible';
+    if (letterA !== letterB && (Math.abs(numA - numB) === 1 || Math.abs(numA - numB) === 11)) return 'compatible';
 
-    // Rule 2: Adjacent on the wheel (same letter, ±1 number, wrapping around at 12)
-    if (letterA === letterB && (Math.abs(numA - numB) === 1 || Math.abs(numA - numB) === 11)) {
-      return true;
+    // Only call a clash when BOTH keys are reasonably confident.
+    // Low-conf disagreement is neutral, not a tier penalty.
+    return (confA >= KEY_CONF_CLASH && confB >= KEY_CONF_CLASH) ? 'incompatible' : 'unknown';
+  }
+
+  private ratioLabel(r: number): string {
+    const candidates: [number, string][] = [
+      [1, '1:1'], [2, '2:1'], [0.5, '1:2'],
+      [1.5, '3:2'], [2 / 3, '2:3'],
+      [1.25, '5:4'], [0.8, '4:5'],
+      [1.2, '6:5'], [5 / 6, '5:6'],
+      [4 / 3, '4:3'], [0.75, '3:4'],
+    ];
+    for (const [v, label] of candidates) {
+      if (Math.abs(r - v) / v <= 0.03) return label;
     }
-
-    // Rule 3: Energy boost (different letter, ±1 number)
-    if (letterA !== letterB && (Math.abs(numA - numB) === 1 || Math.abs(numA - numB) === 11)) {
-      return true;
-    }
-
-    return false;
+    return 'free';
   }
 
   /**
@@ -967,14 +1197,34 @@ export class AutoMixEngine {
     const bpmA = analysisA.bpm > 0 ? analysisA.bpm : 120;
     const bpmB = analysisB.bpm > 0 ? analysisB.bpm : 120;
 
+    // Pairwise octave disambiguation. Try {0.5, 1, 2} on both sides, pick the
+    // closest plausible pair, with a small penalty for unnecessary octave shifts.
+    // Simple ratios like 5:4 / 6:5 are NOT normalized away; they stay real deltas.
     let effectiveBpmA = bpmA;
     let effectiveBpmB = bpmB;
-
-    // Double-time correction
-    if (effectiveBpmA > 130 && Math.abs(effectiveBpmA / 2 - effectiveBpmB) <= 20) effectiveBpmA /= 2;
-    if (effectiveBpmB > 130 && Math.abs(effectiveBpmB / 2 - effectiveBpmA) <= 20) effectiveBpmB /= 2;
+    const octaves = [0.5, 1, 2];
+    let bestPairScore = Infinity;
+    for (const ma of octaves) {
+      for (const mb of octaves) {
+        const a = bpmA * ma;
+        const b = bpmB * mb;
+        if (a < 55 || a > 200 || b < 55 || b > 200) continue;
+        const d = Math.abs(a - b);
+        const score = d + (ma !== 1 ? 2 : 0) + (mb !== 1 ? 2 : 0);
+        if (score < bestPairScore) {
+          bestPairScore = score;
+          effectiveBpmA = a;
+          effectiveBpmB = b;
+        }
+      }
+    }
 
     const delta = Math.abs(effectiveBpmA - effectiveBpmB);
+    const tempoRatio = effectiveBpmB / Math.max(0.001, effectiveBpmA);
+    const ratioLabel = this.ratioLabel(tempoRatio);
+    const tempoRatioAbs = Math.max(tempoRatio, 1 / Math.max(0.001, tempoRatio));
+    const rawRatio = bpmB / Math.max(0.001, bpmA);
+    const rawRatioAbs = Math.max(rawRatio, 1 / Math.max(0.001, rawRatio));
     const avgConf = (analysisA.confidence + analysisB.confidence) / 2;
     const energyDiff = Math.abs(analysisA.energy - analysisB.energy) / Math.max(0.001, analysisA.energy, analysisB.energy);
     const bothVariable = analysisA.tempoVariable && analysisB.tempoVariable;
@@ -982,82 +1232,203 @@ export class AutoMixEngine {
     const severelyUnstable =
       bothVariable && (maxBpmRange > 30 || avgConf < 0.35 || delta > 12);
 
-    const harmonicallyCompatible = this.isHarmonicallyCompatible(analysisA.key, analysisB.key);
+    const keyConfA = analysisA.keyConfidence ?? 0;
+    const keyConfB = analysisB.keyConfidence ?? 0;
+    const KEY_CONF_KNOWN = 0.30;
+    const relation = this.harmonicRelation(analysisA.key, analysisB.key, keyConfA, keyConfB);
+    const keyKnownBoth = !!analysisA.key && !!analysisB.key && keyConfA >= KEY_CONF_KNOWN && keyConfB >= KEY_CONF_KNOWN;
+
+    const beatDuration = 60 / effectiveBpmA;
+    const barDuration = 4 * beatDuration;
+    const effectiveDurationA = Math.min(durationA, analysisA.audibleEndAt ?? durationA);
+    const audibleEndA = analysisA.audibleEndAt ?? durationA;
+
+    let mixPointAt = analysisA.mixPointAt || Math.max(0, effectiveDurationA - 16 * barDuration);
+    // Snap fade point to A's bar grid anchored at the detected downbeat.
+    if (barDuration > 0) {
+      const k = Math.round((mixPointAt - analysisA.beatOffset) / barDuration);
+      mixPointAt = Math.max(0, analysisA.beatOffset + k * barDuration);
+    }
+
+    const outroSecs = Math.max(0, audibleEndA - mixPointAt);
+    const mixEnergyRatio = analysisA.avgRMS && analysisA.avgRMS > 0
+      ? (analysisA.rmsAtMixPoint ?? analysisA.avgRMS) / analysisA.avgRMS
+      : 1;
+    const mixLocalRatio = analysisA.mixLocalRatio ?? 1;
+    const goodExit = analysisA.mixPointAt != null && outroSecs >= 4 * barDuration &&
+      (mixEnergyRatio < 0.90 || mixLocalRatio < 0.75);
+    const stable = !analysisA.tempoVariable && !analysisB.tempoVariable;
 
     const reasons: string[] = [];
     let tier: TransitionTier;
 
+    // ── Safety floor ──
     if (missingBpm) {
       tier = 'XFADE_SHORT'; reasons.push('missingBpm');
-    } else if (delta > 40) {
-      tier = 'XFADE_SHORT'; reasons.push('delta>40');
-    } else if (delta > 20) {
-      tier = 'HARD'; reasons.push('delta>20_HARD');
+    } else if (severelyUnstable) {
+      tier = 'XFADE_SHORT'; reasons.push('severelyUnstable');
     } else if (avgConf < 0.20) {
       tier = 'XFADE_SHORT'; reasons.push('avgConf<0.20');
     } else if (energyDiff > 0.85) {
       tier = 'XFADE_SHORT'; reasons.push('energyDiff>0.85');
-    } else if (severelyUnstable) {
-      tier = 'XFADE_SHORT'; reasons.push('severelyUnstable');
-    } else if (delta <= 2 && avgConf > 0.85 && energyDiff < 0.2 && !analysisA.tempoVariable && !analysisB.tempoVariable && harmonicallyCompatible) {
-      tier = 'PERFECT'; reasons.push('perfect');
-    } else if (delta <= 5 && avgConf > 0.65 && energyDiff < 0.35) {
-      tier = 'CLEAN'; reasons.push('clean');
-    } else if (delta <= 10 && avgConf > 0.5) {
-      tier = 'MODERATE'; reasons.push('moderate');
+    } else if (delta > 40 || rawRatioAbs >= 1.45) {
+      tier = 'CUT'; reasons.push('cut:rawTempoExtreme');
     } else {
-      tier = 'HARD'; reasons.push('hardFallback');
-    }
-
-    // Tier Capping
-    const tierRank: Record<string, number> = {
-      'PERFECT': 4, 'CLEAN': 3, 'MODERATE': 2, 'HARD': 1, 'XFADE_SHORT': 0
-    };
-    let maxAllowedTier = 'PERFECT';
-    
-    if (bothVariable) { maxAllowedTier = 'MODERATE'; reasons.push('cap:bothVariable'); }
-    if (avgConf < 0.5) { maxAllowedTier = 'MODERATE'; reasons.push('cap:avgConf<0.5'); }
-    if (energyDiff > 0.5) { maxAllowedTier = 'MODERATE'; reasons.push('cap:energyDiff>0.5'); }
-
-    if (tierRank[tier] > tierRank[maxAllowedTier]) {
-      reasons.push(`capped:${tier}->${maxAllowedTier}`);
-      tier = maxAllowedTier as TransitionTier;
-    }
-
-    // Harmonic penalty
-    if (!harmonicallyCompatible && tier !== 'XFADE_SHORT' && tier !== 'HARD') {
-      if (tierRank[tier] > tierRank['MODERATE']) {
-        reasons.push(`harmonicClashCap:${tier}->MODERATE`);
-        tier = 'MODERATE';
+      // ── Compatibility-driven tier. BPM delta NO LONGER forces HARD. ──
+      // Delta shapes overlap length below, not the tier label.
+      if (relation === 'compatible' && keyKnownBoth && avgConf >= 0.70 && energyDiff < 0.20 && stable && goodExit && rawRatioAbs <= 1.06) {
+        tier = 'PERFECT'; reasons.push('perfect');
+      } else if (relation !== 'incompatible' && avgConf >= 0.55 && energyDiff < 0.35 && goodExit) {
+        tier = 'CLEAN'; reasons.push('clean');
+      } else if (avgConf >= 0.30 && energyDiff < 0.60) {
+        tier = 'MODERATE'; reasons.push('moderate');
       } else {
-        reasons.push('harmonicClash');
+        tier = 'HARD'; reasons.push('hardFallback');
       }
     }
 
+    // ── Caps ──
+    const tierRank: Record<string, number> = {
+      'PERFECT': 4, 'CLEAN': 3, 'MODERATE': 2, 'HARD': 1, 'XFADE_SHORT': 0, 'CUT': -1
+    };
+    let maxAllowedTier: TransitionTier = 'PERFECT';
+
+    if (bothVariable) { maxAllowedTier = 'MODERATE'; reasons.push('cap:bothVariable'); }
+    if (avgConf < 0.35) { maxAllowedTier = 'MODERATE'; reasons.push('cap:avgConf<0.35'); }
+    if (energyDiff > 0.60) { maxAllowedTier = 'MODERATE'; reasons.push('cap:energyDiff>0.60'); }
+    if (relation === 'incompatible') { maxAllowedTier = 'MODERATE'; reasons.push('cap:harmonicClash'); }
+    if (relation === 'unknown' && tierRank[maxAllowedTier] > tierRank['CLEAN']) {
+      maxAllowedTier = 'CLEAN'; reasons.push('cap:unknownKey');
+    }
+    if (!goodExit && tierRank[maxAllowedTier] > tierRank['CLEAN']) {
+      maxAllowedTier = 'CLEAN'; reasons.push('cap:weakExit');
+    }
+    if (delta > 25 && tierRank[maxAllowedTier] > tierRank['CLEAN']) {
+      maxAllowedTier = 'CLEAN'; reasons.push('cap:delta>25');
+    }
+
+    if (tierRank[tier] > tierRank[maxAllowedTier]) {
+      reasons.push(`capped:${tier}->${maxAllowedTier}`);
+      tier = maxAllowedTier;
+    }
+
+    // ── Overlap safety: fractional bars, ratio-aware, runway-clamped ──
+    // With tempo match disabled, high ratios drift multiple beats over long blends.
+    // Shorten the blend as the ratio departs from 1; CUT for extreme mismatch.
+    let overlapBarsCap: number;
+
+    if (tier === 'CUT') {
+      overlapBarsCap = 0.75;
+    } else {
+      const base = tier === 'PERFECT' ? 16 : tier === 'CLEAN' ? 12 : tier === 'MODERATE' ? 8 : 4;
+      let gapFactor: number;
+      if (rawRatioAbs <= 1.03) gapFactor = 1;
+      else if (rawRatioAbs <= 1.08) gapFactor = 0.85;
+      else if (rawRatioAbs <= 1.15) gapFactor = 0.6;
+      else if (rawRatioAbs <= 1.25) gapFactor = 0.4;
+      else if (rawRatioAbs <= 1.4) gapFactor = 0.25;
+      else gapFactor = 0.15;
+
+      overlapBarsCap = base * gapFactor;
+      const minBars = (tier === 'XFADE_SHORT' || tier === 'HARD') ? 1.5 : 2;
+      overlapBarsCap = Math.max(minBars, overlapBarsCap);
+    }
+
+    // Harmonic clash: keep the blend short regardless of tier label.
+    if (relation === 'incompatible') overlapBarsCap = Math.min(overlapBarsCap, 3);
+
+    const maxBarsInOutro = outroSecs / barDuration - 0.5;
+    if (maxBarsInOutro >= 1) overlapBarsCap = Math.min(overlapBarsCap, maxBarsInOutro);
+    else overlapBarsCap = Math.min(overlapBarsCap, 1);
+
+    // Beat-drift time cap: with stretch off, overlap must not accumulate more
+    // than ~1.5 beats of drift (0.75 for CUT). Uses real playback BPMs, not
+    // octave-halved bar math, so a 60-BPM effective anchor can't stretch a blend.
+    const bpmAReal = analysisA.bpm > 0 ? analysisA.bpm : effectiveBpmA;
+    const bpmBReal = analysisB.bpm > 0 ? analysisB.bpm : effectiveBpmB;
+    const driftBps = Math.abs(bpmAReal - bpmBReal) / 60;
+    const maxDriftBeats = tier === 'CUT' ? 0.75 : 1.5;
+    const driftCapSecs = maxDriftBeats / Math.max(0.001, driftBps);
+    let overlapSecs = Math.max(0.5, Math.min(overlapBarsCap * barDuration, driftCapSecs));
+    let fadeOutAt = mixPointAt;
+    let fadeInAt = mixPointAt;
+
+    const outroSilenceA = analysisA.outroSilenceSecs ?? 0;
+    if (outroSilenceA > 0.75) {
+      const latestFadeOut = Math.max(0, audibleEndA - overlapSecs);
+      if (fadeOutAt > latestFadeOut) {
+        fadeOutAt = latestFadeOut;
+        fadeInAt = fadeOutAt;
+        reasons.push('clamp:outroSilence');
+      }
+    }
+    if (fadeOutAt > audibleEndA - 0.25) {
+      fadeOutAt = Math.max(0, audibleEndA - 0.25);
+      fadeInAt = fadeOutAt;
+      reasons.push('clamp:audibleEnd');
+    }
+
+    // ── Incoming entry aligned to B's bar grid (Step 4) ──
+    const barDurationB = 4 * (60 / effectiveBpmB);
+    const gridB = analysisB.beatOffset ?? 0;
+    const rawEntryB =
+      analysisB.safeStartOffset && analysisB.safeStartOffset > 0.30
+        ? analysisB.safeStartOffset
+        : Math.max(0, gridB);
+    let incomingOffset = rawEntryB;
+    if (barDurationB > 0) {
+      const k = Math.max(0, Math.ceil((rawEntryB - gridB) / barDurationB - 1e-6));
+      incomingOffset = Math.max(0, gridB + k * barDurationB);
+    }
+
+    // TEMPO MATCH DISABLED (stopgap). Direction was inverted, playbackRate resamples
+    // pitch, and rate was never restored. Unity until pitch-preserving stretch exists.
+    const stretchRatio = 1.0;
+
+    const gainA = analysisA.normalGain ?? 1;
+    const gainB = analysisB.normalGain ?? 1;
+    const loudnessDiffDb = Math.abs((analysisA.loudnessDb ?? -16) - (analysisB.loudnessDb ?? -16));
+
     const decisionInfo = {
       bpmA: analysisA.bpm, bpmB: analysisB.bpm,
+      bpmRawA: analysisA.bpmRaw, bpmRawB: analysisB.bpmRaw,
       bpmReliableA, bpmReliableB,
       bpmRangeA: analysisA.bpmRange, bpmRangeB: analysisB.bpmRange,
       tempoVariableA: analysisA.tempoVariable, tempoVariableB: analysisB.tempoVariable,
       bothVariable, delta, avgConf, energyDiff, maxBpmRange,
-      harmonicallyCompatible, chosenTier: tier, reasons,
+      effectiveBpmA, effectiveBpmB, tempoRatio, ratioLabel,
+      rawRatio, rawRatioAbs, tempoRatioAbs,
+      harmonicallyCompatible: relation === 'compatible',
+      relation,
+      keyA: analysisA.key, keyB: analysisB.key,
+      keyConfA, keyConfB, keyKnownBoth,
+      bpmConfidenceRawA: analysisA.bpmConfidenceRaw, bpmConfidenceRawB: analysisB.bpmConfidenceRaw,
+      bpmAgreementA: analysisA.bpmAgreement, bpmAgreementB: analysisB.bpmAgreement,
+      bpmSourceA: analysisA.bpmSource, bpmSourceB: analysisB.bpmSource,
+      bpmWindowCountA: analysisA.bpmWindowCount, bpmWindowCountB: analysisB.bpmWindowCount,
+      bpmWindowsTotalA: analysisA.bpmWindowsTotal, bpmWindowsTotalB: analysisB.bpmWindowsTotal,
+      windowBpmsA: analysisA.windowBpms, windowBpmsB: analysisB.windowBpms,
+      mixLocalRatio,
+      loudnessDbA: analysisA.loudnessDb, loudnessDbB: analysisB.loudnessDb,
+      gainA, gainB, loudnessDiffDb,
+      driftBps, driftCapSecs, overlapSecs,
+      goodExit, mixEnergyRatio, outroSecs, overlapBarsCap,
+      chosenTier: tier, reasons,
+      tempoMatchEnabled: false,
       safeStartB: analysisB.safeStartOffset ?? 0,
       introSilenceB: analysisB.introSilenceSecs ?? 0,
       introEnergyB: analysisB.introEnergy ?? 0,
       outroSilenceA: analysisA.outroSilenceSecs ?? 0,
-      audibleEndA: analysisA.audibleEndAt ?? durationA,
-      incomingOffset:
-        analysisB.safeStartOffset && analysisB.safeStartOffset > 0.30
-          ? analysisB.safeStartOffset
-          : 0,
+      audibleEndA,
+      incomingOffset,
     };
-    
+
     console.log('[automix] transition decision', decisionInfo);
 
     const w = window as any;
     w.__automixStats = w.__automixStats || {};
     w.__automixStats[tier] = (w.__automixStats[tier] || 0) + 1;
-    
+
     w.__automixDecisions = w.__automixDecisions || [];
     w.__automixDecisions.push({ ts: Date.now(), ...decisionInfo });
     if (w.__automixDecisions.length > 100) w.__automixDecisions.shift();
@@ -1074,58 +1445,6 @@ export class AutoMixEngine {
 
     console.table(w.__automixStats);
 
-    const beatDuration = 60 / effectiveBpmA;
-    const barDuration = 4 * beatDuration;
-    const effectiveDurationA = Math.min(durationA, analysisA.audibleEndAt ?? durationA);
-    const mixPointAt = analysisA.mixPointAt || Math.max(0, effectiveDurationA - 16 * barDuration);
-
-    let overlapBarsCap = 8;
-
-    if (tier === 'XFADE_SHORT') {
-      overlapBarsCap = 4;
-    } else if (tier === 'PERFECT') {
-      overlapBarsCap = 16; // Reward perfection with a longer, cinematic blend
-    } else if (tier === 'HARD') {
-      overlapBarsCap = 4;
-    } else {
-      overlapBarsCap = 12;
-    }
-
-    const overlapSecs = overlapBarsCap * barDuration;
-    let fadeOutAt = mixPointAt;
-    let fadeInAt = mixPointAt; // Both tracks start fading at the same time, but EQ wiping creates the stagger effect
-
-    const outroSilenceA = analysisA.outroSilenceSecs ?? 0;
-    const audibleEndA = analysisA.audibleEndAt ?? durationA;
-
-    if (outroSilenceA > 0.75) {
-      const latestFadeOut = Math.max(0, audibleEndA - overlapSecs);
-
-      if (fadeOutAt > latestFadeOut) {
-        fadeOutAt = latestFadeOut;
-        fadeInAt = fadeOutAt;
-        reasons.push('clamp:outroSilence');
-      }
-    }
-
-    // Never allow the transition to begin after the audible end.
-    if (fadeOutAt > audibleEndA - 0.25) {
-      fadeOutAt = Math.max(0, audibleEndA - 0.25);
-      fadeInAt = fadeOutAt;
-      reasons.push('clamp:audibleEnd');
-    }
-
-    const incomingOffset =
-      analysisB.safeStartOffset && analysisB.safeStartOffset > 0.30
-        ? analysisB.safeStartOffset
-        : 0;
-
-    let stretchRatio = 1.0;
-    if (['PERFECT', 'CLEAN', 'MODERATE'].includes(tier)) {
-      stretchRatio = effectiveBpmB / effectiveBpmA;
-      stretchRatio = Math.max(0.94, Math.min(1.06, stretchRatio)); // Max 6% stretch
-    }
-
     return {
       fadeOutAt,
       fadeInAt,
@@ -1135,9 +1454,13 @@ export class AutoMixEngine {
       barDuration,
       bpmA: effectiveBpmA,
       beatOffsetA: analysisA.beatOffset,
+      bpmB: effectiveBpmB,
+      beatOffsetB: analysisB.beatOffset ?? 0,
       keyA: analysisA.key,
       keyB: analysisB.key,
       incomingOffset,
+      gainA,
+      gainB,
     };
   }
 
@@ -1155,35 +1478,25 @@ export class AutoMixEngine {
     const ctx = this.context;
     const now = ctx.currentTime;
 
-    // ═══ 1. Calculate Beat Sync Delay (FIXED) ═══
-    const beatDuration = 60 / plan.bpmA;
-    const timeSinceStart = this.getCurrentPlaybackTime(activeDeck) - plan.beatOffsetA;
-    const currentBeatPhase = ((timeSinceStart % beatDuration) + beatDuration) % beatDuration;
-    const beatSyncDelay = beatDuration - currentBeatPhase;
-
-    // ═══ 2. Schedule Next Deck Playback ═══
-    const startDeckBAt = now + beatSyncDelay;
+    // fadeOutAt is already phrase/bar-aligned on deck A's grid (planTransition).
+    // Start B at the scheduled fade point. The old "wait for next beat" logic
+    // pushed the entry up to one beat PAST the downbeat when phase was ~0.
+    const startDeckBAt = now;
 
     const requestedOffset = nextDeck.startOffset || 0;
-    const safeOffset = plan.incomingOffset ?? 0;
+    const safeOffset = plan.incomingOffset ?? 0; // pre-aligned to B's bar grid in plan
 
-    // Hard safety cap:
-    // Never skip more than 12 seconds or more than 25% of the incoming track.
+    // Hard safety cap: never skip more than 12s or 25% of the incoming track.
     const maxIntroSkip = Math.min(12, nextDeck.audioBuffer.duration * 0.25);
-
     const safeOffsetValid =
       safeOffset > 0.30 &&
       safeOffset <= maxIntroSkip &&
       safeOffset < nextDeck.audioBuffer.duration - 1;
 
     let offsetInB = requestedOffset;
-
-    // Only use safe offset for freshly loaded automix decks.
     if (requestedOffset <= 0.25 && safeOffsetValid) {
       offsetInB = safeOffset;
     }
-
-    // Final safety guard.
     if (offsetInB >= nextDeck.audioBuffer.duration) {
       offsetInB = 0;
     }
@@ -1194,53 +1507,73 @@ export class AutoMixEngine {
       safeOffsetValid,
       maxIntroSkip,
       offsetInB,
+      beatOffsetB: plan.beatOffsetB,
+      bpmB: plan.bpmB,
     });
 
-    // Create new source for Deck B
     const sourceB = ctx.createBufferSource();
     sourceB.buffer = nextDeck.audioBuffer;
     sourceB.connect(nextDeck.analyser);
     sourceB.start(startDeckBAt, offsetInB);
 
-    nextDeck.startOffset = offsetInB;
-
-    // ═══ 3. Native playbackRate Automation (NO MORE requestAnimationFrame HACKS) ═══
+    // Tempo match disabled (stopgap): unity rate, no pitch resampling.
+    // Guard retained for future pitch-preserving re-enable.
     if (plan.stretchRatio !== 1.0) {
       sourceB.playbackRate.setValueAtTime(1.0, startDeckBAt);
-      sourceB.playbackRate.linearRampToValueAtTime(plan.stretchRatio, startDeckBAt + 2.0); // Ramp over 2 seconds
+      sourceB.playbackRate.linearRampToValueAtTime(plan.stretchRatio, startDeckBAt + 2.0);
     }
 
-    // ═══ 4. 3-Band Dynamic EQ Wipe (NEW) ═══
     const transitionDuration = plan.overlapSecs;
     const endTime = startDeckBAt + transitionDuration;
 
-    // Active deck (A) fades out, EQs cut sequentially (High → Mid → Low)
-    activeDeck.gain.gain.setValueAtTime(1.0, startDeckBAt);
-    activeDeck.gain.gain.linearRampToValueAtTime(0.001, endTime);
+    // Clear stale automation before writing new curves (interrupted transitions, seeks).
+    for (const d of [activeDeck, nextDeck]) {
+      d.gain.gain.cancelScheduledValues(startDeckBAt);
+      d.eqHigh.gain.cancelScheduledValues(startDeckBAt);
+      d.eqMid.gain.cancelScheduledValues(startDeckBAt);
+      d.eqLow.gain.cancelScheduledValues(startDeckBAt);
+    }
 
+    // Equal-power crossfade (cos/sin). Linear ramps dip ~3dB at the midpoint.
+    const gA = plan.gainA ?? 1;
+    const gB = plan.gainB ?? 1;
+    const N = 64;
+    const fadeOutCurve = new Float32Array(N);
+    const fadeInCurve = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const t = i / (N - 1);
+      fadeOutCurve[i] = Math.cos(t * Math.PI / 2) * gA;
+      fadeInCurve[i] = Math.sin(t * Math.PI / 2) * gB;
+    }
+    fadeOutCurve[N - 1] = 0.0001;
+    activeDeck.gain.gain.setValueCurveAtTime(fadeOutCurve, startDeckBAt, transitionDuration);
+    nextDeck.gain.gain.setValueCurveAtTime(fadeInCurve, startDeckBAt, transitionDuration);
+
+    // Short drift-capped blends keep A fuller longer; long blends get the full wipe.
+    const shortBlend = transitionDuration < 6;
+    const hiDepth = shortBlend ? -8 : -12;
+    const midDepth = shortBlend ? -6 : -8;
+    const lowDepth = shortBlend ? -10 : -12;
+    const hiFrac = shortBlend ? 0.5 : 0.3;
+    const midFrac = shortBlend ? 0.75 : 0.6;
+    const lowFrac = shortBlend ? 0.95 : 0.9;
+
+    // A: High -> Mid -> Low out
     activeDeck.eqHigh.gain.setValueAtTime(0, startDeckBAt);
-    activeDeck.eqHigh.gain.linearRampToValueAtTime(-12, startDeckBAt + transitionDuration * 0.3);
-
+    activeDeck.eqHigh.gain.linearRampToValueAtTime(hiDepth, startDeckBAt + transitionDuration * hiFrac);
     activeDeck.eqMid.gain.setValueAtTime(0, startDeckBAt);
-    activeDeck.eqMid.gain.linearRampToValueAtTime(-8, startDeckBAt + transitionDuration * 0.6);
-
+    activeDeck.eqMid.gain.linearRampToValueAtTime(midDepth, startDeckBAt + transitionDuration * midFrac);
     activeDeck.eqLow.gain.setValueAtTime(0, startDeckBAt);
-    activeDeck.eqLow.gain.linearRampToValueAtTime(-12, startDeckBAt + transitionDuration * 0.9); // Bass last
+    activeDeck.eqLow.gain.linearRampToValueAtTime(lowDepth, startDeckBAt + transitionDuration * lowFrac);
 
-    // Next deck (B) fades in, EQs boost sequentially (High → Mid → Low)
-    nextDeck.gain.gain.setValueAtTime(0.001, startDeckBAt);
-    nextDeck.gain.gain.linearRampToValueAtTime(1.0, endTime);
+    // B: mirror in
+    nextDeck.eqHigh.gain.setValueAtTime(hiDepth, startDeckBAt);
+    nextDeck.eqHigh.gain.linearRampToValueAtTime(0, startDeckBAt + transitionDuration * hiFrac);
+    nextDeck.eqMid.gain.setValueAtTime(midDepth, startDeckBAt);
+    nextDeck.eqMid.gain.linearRampToValueAtTime(0, startDeckBAt + transitionDuration * midFrac);
+    nextDeck.eqLow.gain.setValueAtTime(lowDepth, startDeckBAt);
+    nextDeck.eqLow.gain.linearRampToValueAtTime(0, startDeckBAt + transitionDuration * lowFrac);
 
-    nextDeck.eqHigh.gain.setValueAtTime(-12, startDeckBAt);
-    nextDeck.eqHigh.gain.linearRampToValueAtTime(0, startDeckBAt + transitionDuration * 0.3);
-
-    nextDeck.eqMid.gain.setValueAtTime(-8, startDeckBAt);
-    nextDeck.eqMid.gain.linearRampToValueAtTime(0, startDeckBAt + transitionDuration * 0.6);
-
-    nextDeck.eqLow.gain.setValueAtTime(-12, startDeckBAt);
-    nextDeck.eqLow.gain.linearRampToValueAtTime(0, startDeckBAt + transitionDuration * 0.9);
-
-    // ═══ 5. Update Deck State ═══
     sourceB.onended = () => {
       if (nextDeck.sourceNode === sourceB) {
         nextDeck.isPlaying = false;
@@ -1257,12 +1590,11 @@ export class AutoMixEngine {
     nextDeck.startOffset = offsetInB;
     nextDeck.isPlaying = true;
 
-    // Stop active deck after transition
     try {
       activeDeck.sourceNode?.stop(endTime + 0.1);
     } catch {}
 
-    console.log(`[AutoMix] Executing ${plan.method} | BeatDelay=${(beatSyncDelay * 1000).toFixed(0)}ms | Duration=${transitionDuration.toFixed(1)}s | Key=${plan.keyA} -> ${plan.keyB}`);
+    console.log(`[AutoMix] Executing ${plan.method} | Duration=${transitionDuration.toFixed(1)}s | Key=${plan.keyA} -> ${plan.keyB} | offsetB=${offsetInB.toFixed(2)}s`);
   }
 
   /**

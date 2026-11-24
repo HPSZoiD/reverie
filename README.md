@@ -2,6 +2,10 @@
 
 **Reverie is a self-hosted music player with DJ-style auto-mix transitions and YouTube streaming capabilities.**
 
+## About
+
+Reverie is a local-first music player and DJ engine. It scans your own audio library, analyzes each track for tempo, key, and energy, then plays them through a web UI with beat-matched, harmonically compatible transitions instead of hard cuts. YouTube Music search and radio queues can be mixed into the same queue, so local files and streamed tracks feel like one continuous set. Everything runs self-hosted on a FastAPI backend with a React frontend.
+
 ## 🎵 Overview
 
 Reverie is a full-featured audio application that combines local music library management with intelligent beat-matched transitions and YouTube integration. It's designed to provide an immersive listening experience by intelligently mixing tracks together using advanced audio analysis and DJ-style transitions.

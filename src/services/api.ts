@@ -89,9 +89,23 @@ export const api = {
       body: JSON.stringify({ video_id: videoId }),
     }),
 
-  getQueue: (videoId: string, currentBpm?: number): Promise<Track[]> => {
-    const bpmParam = currentBpm ? `&current_bpm=${currentBpm}` : '';
-    return fetch(`${API}/api/queue/next?video_id=${encodeURIComponent(videoId)}${bpmParam}`).then((r) => r.json());
+  getQueue: (
+    videoId: string,
+    current?: {
+      bpm?: number | null;
+      key?: string | null;
+      keyConfidence?: number | null;
+      energy?: number | null;
+      loudnessDb?: number | null;
+    }
+  ): Promise<Track[]> => {
+    const p = new URLSearchParams({ video_id: videoId });
+    if (current?.bpm) p.set('current_bpm', String(current.bpm));
+    if (current?.key) p.set('current_key', current.key);
+    if (current?.keyConfidence != null) p.set('current_key_conf', String(current.keyConfidence));
+    if (current?.energy != null) p.set('current_energy', String(current.energy));
+    if (current?.loudnessDb != null) p.set('current_loudness', String(current.loudnessDb));
+    return fetch(`${API}/api/queue/next?${p.toString()}`).then((r) => r.json());
   },
 
   getRecommendations: (userId: string): Promise<Track[]> =>

@@ -13,6 +13,7 @@ dist/
 
 # Logs
 *.log
+backend-*.log
 
 # Local data
 database/*.db
@@ -24,6 +25,12 @@ database/*.db-journal
 # Test media
 test_audio.m4a
 test_ytdlp.m4a
+*.m4a
+*.mp3
+*.wav
+*.audit.wav
+*.analysis.wav
+backend/audio/
 
 # OS
 .DS_Store

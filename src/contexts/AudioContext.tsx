@@ -62,6 +62,14 @@ export function AudioProvider({ children }: { children: ReactNode }) {
   const playerBRef = useRef<AudioPlayer | null>(null);
   const prepareTaskVersionRef = useRef(0);
 
+  const transitionTokenRef = useRef(0);
+  const transitionTriggerRef = useRef<{
+    src: AudioBufferSourceNode | null;
+    zero: GainNode | null;
+    timeoutId: number | null;
+  }>({ src: null, zero: null, timeoutId: null });
+  const transitionExecutingRef = useRef(false);
+
   const activeDeckRef = useRef<'A' | 'B'>('A');
   const currentTrackRef = useRef<Track | null>(null);
   const nextTrackRef = useRef<Track | null>(null);
@@ -215,14 +223,29 @@ export function AudioProvider({ children }: { children: ReactNode }) {
     deck.gain.gain.setValueAtTime(gainValue, now);
   }, []);
 
+  const cancelScheduledTransition = useCallback(() => {
+    transitionTokenRef.current += 1;
+    const h = transitionTriggerRef.current;
+    if (h.src) {
+      try { h.src.onended = null; h.src.stop(); h.src.disconnect(); } catch {}
+    }
+    if (h.zero) {
+      try { h.zero.disconnect(); } catch {}
+    }
+    if (h.timeoutId != null) {
+      window.clearTimeout(h.timeoutId);
+    }
+    transitionTriggerRef.current = { src: null, zero: null, timeoutId: null };
+  }, []);
+
   const scheduleTransition = useCallback(
     (plan: TransitionPlan) => {
+      // Disarm any previous trigger FIRST. Seek/resume/skipPrev re-arm the same
+      // plan object; without cancellation the old silent source fires early.
+      cancelScheduledTransition();
       planRef.current = plan;
+      const myToken = transitionTokenRef.current;
 
-      // Sample-accurate trigger: arm a silent one-sample buffer on the Web
-      // Audio clock so the transition fires at exactly fadeOutAt even when
-      // JS timers are throttled (screen off / background tab). The interval
-      // poller remains as a fallback safety net.
       const eng = engineRef.current;
       const ctx = eng?.context;
       const deck = activeDeckRef.current === 'A' ? eng?.deckA : eng?.deckB;
@@ -231,18 +254,16 @@ export function AudioProvider({ children }: { children: ReactNode }) {
         const delay = Math.max(0, plan.fadeOutAt - ct);
 
         const trigger = () => {
+          if (myToken !== transitionTokenRef.current) return; // stale trigger
           if (!automixEnabledRef.current) return;
-          const active = activeDeckRef.current === 'A'
-            ? eng!.deckA
-            : eng!.deckB;
+          const active = activeDeckRef.current === 'A' ? eng!.deckA : eng!.deckB;
           if (active?.isPlaying && planRef.current === plan) {
             runExecuteRef.current(plan);
           }
         };
 
         if (delay <= 0.05) {
-          // Fade point is essentially now — fire immediately on next tick
-          window.setTimeout(trigger, 0);
+          transitionTriggerRef.current.timeoutId = window.setTimeout(trigger, 0);
         } else {
           try {
             const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
@@ -255,16 +276,17 @@ export function AudioProvider({ children }: { children: ReactNode }) {
             zero.connect(ctx.destination);
             src.onended = trigger;
             src.start(ctx.currentTime + delay);
+            transitionTriggerRef.current.src = src;
+            transitionTriggerRef.current.zero = zero;
           } catch {
-            // Fall back to an approximate timer if clock scheduling fails
-            window.setTimeout(trigger, delay * 1000);
+            transitionTriggerRef.current.timeoutId = window.setTimeout(trigger, delay * 1000);
           }
         }
       }
 
       console.log(`[AutoMix] Transition armed for fadeOutAt: ${plan.fadeOutAt.toFixed(2)}s`);
     },
-    []
+    [cancelScheduledTransition]
   );
 
 
@@ -294,7 +316,14 @@ export function AudioProvider({ children }: { children: ReactNode }) {
         // If queue is empty or all items were duplicates, fetch a new queue
         if (cleanQ.length === 0) {
           console.log('[Reverie] Queue empty, fetching new queue from server...');
-          const q = await api.getQueue(ct.id, currentAnalysisRef.current?.bpm ?? undefined);
+          const ca = currentAnalysisRef.current;
+          const q = await api.getQueue(ct.id, {
+            bpm: ca?.bpm,
+            key: ca?.key,
+            keyConfidence: ca?.keyConfidence,
+            energy: ca?.energy,
+            loudnessDb: ca?.loudnessDb,
+          });
           if (prepareTaskVersionRef.current !== currentTaskVersion) return;
           cleanQ = q.filter(t => !badIds.has(t.id));
         }
@@ -354,6 +383,14 @@ export function AudioProvider({ children }: { children: ReactNode }) {
           inactive.onAnalyzed = (r) => {
             if (prepareTaskVersionRef.current !== currentTaskVersion) return;
             nextAnalysisRef.current = r;
+            if (enriched.key && r.key && enriched.key !== r.key) {
+              console.warn('[AutoMix] key disagreement', {
+                title: enriched.title,
+                backend: enriched.key,
+                frontend: r.key,
+                frontendConf: r.keyConfidence,
+              });
+            }
             setNextBpm(r.bpm);
           };
 
@@ -367,16 +404,48 @@ export function AudioProvider({ children }: { children: ReactNode }) {
           }
 
           // 4. Plan the mix — nextAnalysisRef.current is guaranteed to be set now.
-          if (currentAnalysisRef.current && nextAnalysisRef.current) {
+          const analysisA = currentAnalysisRef.current as AnalysisResult | null;
+          const analysisB = nextAnalysisRef.current as AnalysisResult | null;
+          if (analysisA && analysisB) {
             const activePlayer = activeDeckRef.current === 'A' ? playerARef.current : playerBRef.current;
             const dur = activePlayer?.duration ?? 0;
             if (!dur) return;
 
             const plan = engineRef.current!.planTransition(
-              currentAnalysisRef.current,
-              nextAnalysisRef.current,
+              analysisA,
+              analysisB,
               dur
             );
+
+            console.info('[AutoMix] plan pair', {
+              titleA: currentTrackRef.current?.title,
+              backendKeyA: currentTrackRef.current?.key,
+              backendBpmA: currentTrackRef.current?.bpm,
+              frontendKeyA: analysisA.key,
+              frontendKeyConfA: analysisA.keyConfidence,
+              frontendBpmA: analysisA.bpm,
+              bpmRawA: analysisA.bpmRaw,
+              titleB: enriched.title,
+              backendKeyB: enriched.key,
+              backendKeyConfB: enriched.keyConfidence,
+              backendBpmB: enriched.bpm,
+              frontendKeyB: analysisB.key,
+              frontendKeyConfB: analysisB.keyConfidence,
+              frontendBpmB: analysisB.bpm,
+              bpmRawB: analysisB.bpmRaw,
+              tier: plan.method,
+              overlapSecs: plan.overlapSecs,
+            });
+
+            if (enriched.bpm && analysisB.bpm &&
+                Math.abs(enriched.bpm - analysisB.bpm) > 5) {
+              console.warn('[AutoMix] bpm disagreement', {
+                title: enriched.title,
+                backendBpm: enriched.bpm,
+                frontendBpm: analysisB.bpm,
+                bpmRaw: analysisB.bpmRaw,
+              });
+            }
 
             console.log('[AutoMix] Plan created:', plan.method, '| fadeOutAt:', plan.fadeOutAt.toFixed(1));
             setUpcomingTier(plan.method);
@@ -385,7 +454,6 @@ export function AudioProvider({ children }: { children: ReactNode }) {
             scheduleTransition(plan);
           }
         }
-        queuePreparedForIdRef.current = null;
       } catch (err) {
         console.error('[Reverie] prepare next failed:', err);
         setNextTrack(null);
@@ -421,6 +489,10 @@ export function AudioProvider({ children }: { children: ReactNode }) {
       setUpcomingTier(null);
       return;
     }
+
+    if (transitionExecutingRef.current) return;
+    transitionExecutingRef.current = true;
+    cancelScheduledTransition();
 
     const active = activeDeckRef.current === 'A' ? eng.deckA : eng.deckB;
     const incoming = activeDeckRef.current === 'A' ? eng.deckB : eng.deckA;
@@ -474,6 +546,7 @@ export function AudioProvider({ children }: { children: ReactNode }) {
     // ═══════════════════════════════════════
     const deferMs = (plan.overlapSecs + 1.5) * 1000;
     window.setTimeout(() => {
+      transitionExecutingRef.current = false;
       setTransitionActive(false);
 
       // Now it's safe to clean up the old track file from the server
@@ -497,7 +570,7 @@ export function AudioProvider({ children }: { children: ReactNode }) {
         );
       }
     }, deferMs);
-  }, [prepareNextForCurrent, setQueue]);
+  }, [prepareNextForCurrent, setQueue, cancelScheduledTransition]);
 
   runExecuteRef.current = runExecute;
 
@@ -1087,6 +1160,7 @@ export function AudioProvider({ children }: { children: ReactNode }) {
   // MODE SWITCH (AutoMix ON <-> OFF) mid-playback
   // ═══════════════════════════════════════
   useEffect(() => {
+    cancelScheduledTransition();
     const cur = currentTrackRef.current;
     if (!cur?.audio_url) return;
 
@@ -1115,7 +1189,7 @@ export function AudioProvider({ children }: { children: ReactNode }) {
         console.error('[Reverie] Mode switch to AutoMix failed', e)
       );
     }
-  }, [automixEnabled, getAudioEl]);
+  }, [automixEnabled, getAudioEl, cancelScheduledTransition]);
 
   const value = useMemo(
     () => ({
