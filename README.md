@@ -19,6 +19,31 @@ Key features include:
 - Sample-accurate beat synchronization
 - Web-based interface with modern UI/UX
 
+## 🎧 AutoMix Engine (v2.0 Stable)
+
+Reverie features a custom-built, musically-aware AutoMix engine designed to deliver seamless, "Apple Music-tier" transitions between tracks. It moves beyond simple crossfading by analyzing track structure, key, and tempo to make intelligent mixing decisions in real-time.
+
+### Key Features
+
+*   **Safe & Musical Execution:**
+    *   No "chipmunk" or slowed-down pitch shifts. Tempo matching is safely disabled to preserve original audio fidelity.
+    *   **Equal-Power Crossfades:** Uses `cos/sin` gain curves to prevent the 3dB volume dip in the middle of blends.
+*   **Phrase-Aligned Transitions:**
+    *   Both the outgoing fade-out point and the incoming track entry are snapped to their respective musical bar grids, ensuring transitions happen on the beat, not mid-phrase.
+*   **Adaptive EQ Wipes:**
+    *   Short, drift-capped blends keep the outgoing track fuller for longer to avoid hollow transitions.
+    *   Long, cinematic blends utilize a full 3-band dynamic EQ wipe (High → Mid → Low) for smooth frequency handoffs.
+*   **Smart Queue Selection:**
+    *   **Key-First Ranking:** Uses Camelot Wheel harmonic compatibility to prioritize musically compatible tracks. Confident harmonic clashes are safely demoted.
+    *   **Tempo Proximity & Safety:** Ranks tracks by BPM closeness and enforces a "safety ordering" to ensure the top 3 queue slots are never occupied by extreme tempo mismatches or cold (unanalyzed) candidates.
+    *   **Adaptive Warm-up:** Intelligently waits for background audio analysis to complete before scoring the queue, ensuring warm, data-driven track selection.
+*   **Master Limiter & Loudness Normalization:**
+    *   Routes all playback through a master gain and compressor to prevent clipping.
+    *   Normalizes track loudness to a -14 dBFS RMS target, eliminating jarring volume jumps between quiet and heavily mastered tracks.
+*   **Rich Telemetry & Observability:**
+    *   Every transition logs a detailed `[AutoMix] plan pair` to the browser console, showing frontend key/BPM, confidence, and overlap details.
+    *   Includes a built-in `window.exportAutomixDebug()` function to dump the last 100 transition decisions to JSON for deep-dive analysis.
+
 ## 🏗️ Architecture
 
 ### Backend (Python/Server-side)
